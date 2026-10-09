@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+build/pyi-work/
+dist/
+*.spec
+# 開發用：研究資料與打包環境
+research/
+.winbuild/
