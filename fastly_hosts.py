@@ -6,6 +6,7 @@
 也可以加參數執行：
   test      找出最順的路線，只測試、不改任何設定
   apply     測試後把最順的路線寫入 hosts（需要管理員 / root）
+  region [代碼]  手動選擇地區，例如：region ICN、region 首爾
   restore   移除本工具寫入的設定
   status    顯示目前狀況
   --yes     套用時不再詢問確認
@@ -27,7 +28,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 IS_WINDOWS = platform.system() == "Windows"
 HOSTS_PATH = (os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "drivers", "etc", "hosts")
               if IS_WINDOWS else "/etc/hosts")
@@ -63,7 +64,7 @@ POP_NAMES = {
     "BNE": "布里斯本", "PER": "伯斯", "ADL": "阿德雷德", "AKL": "奧克蘭", "WLG": "威靈頓",
     "CHC": "基督城", "BOM": "孟買", "DEL": "德里", "MAA": "清奈", "HYD": "海得拉巴",
     "CCU": "加爾各答", "DXB": "杜拜", "RUH": "利雅德", "LAX": "洛杉磯", "BUR": "洛杉磯",
-    "SJC": "聖荷西", "PAO": "帕羅奧圖", "SEA": "西雅圖", "BFI": "西雅圖", "PDX": "波特蘭",
+    "SJC": "聖荷西", "WVI": "華森維爾", "PAO": "帕羅奧圖", "SEA": "西雅圖", "BFI": "西雅圖", "PDX": "波特蘭",
     "YVR": "溫哥華", "DFW": "達拉斯", "IAH": "休士頓", "ORD": "芝加哥", "CHI": "芝加哥",
     "IAD": "華盛頓", "NYC": "紐約", "EWR": "紐約", "LGA": "紐約", "JFK": "紐約",
     "BOS": "波士頓", "ATL": "亞特蘭大", "MIA": "邁阿密", "YYZ": "多倫多", "YUL": "蒙特婁",
@@ -92,6 +93,8 @@ SPEED_ROUNDS = 3
 SPEED_SAMPLE_SECONDS = 3
 SPEED_SAMPLE_BYTES = 8 << 20  # 每次最多 8 MB，快的路線不到一秒就結束，控制總流量
 FAST_RATIO = 0.3            # 速度達到本次測到最快值的 30% 才算「順暢」
+FAST_FLOOR_MBPS = 3.0       # 而且至少 3 Mbps：實測卡住時是 0.3～2.3 Mbps；
+                            # 只測單一地區、全部都卡住時，光看相對比例會把卡住誤判成順暢
 SPEED_REPOS = ["ollama/ollama", "cli/cli"]  # 從這些專案的最新 release 挑最大的檔案測速
 TIMEOUT = 10
 LINE = "─" * 56
@@ -245,8 +248,8 @@ def same_24(ip, suffix):
     return ".".join(ip.split(".")[:3] + [str(suffix)])
 
 
-def scan(ranges):
-    """每個 /24 挑一個 IP，用 GitHub 網域做 HEAD，回傳能用的 IP（依延遲排序，前 30 名）。"""
+def scan(ranges, label="步驟 1/2：尋找附近的節點…"):
+    """每個 /24 挑一個 IP，用 GitHub 網域做 HEAD，回傳所有能用的 IP（依延遲排序）。"""
     ips = []
     for cidr in ranges:
         net = ipaddress.ip_network(cidr, strict=False)
@@ -259,21 +262,21 @@ def scan(ranges):
             if fut.result():
                 found.append(fut.result())
             if done % 24 == 0 or done == len(futures):
-                progress("步驟 1/2：尋找附近的節點…", done, len(futures))
+                progress(label, done, len(futures))
     # 掃描時同時連線多，延遲不準；前 30 名再各量 3 次排序
     found.sort(key=lambda r: r["latency_ms"])
     top = found[:30]
     for r in top:
         r["latency_ms"] = tcp_latency(r["ip"], tries=3, timeout=SCAN_TIMEOUT) or 9e9
     top.sort(key=lambda r: r["latency_ms"])
-    return top, len(ips), len(found)
+    return top + found[30:], len(ips), len(found)
 
 
-def speed_test(candidates):
+def speed_test(candidates, rounds=SPEED_ROUNDS, label="步驟 2/2：實際測試下載速度…"):
     """多輪交錯測速。回傳 {ip: [Mbps, ...]}。"""
     speeds = {c["ip"]: [] for c in candidates}
-    total, done = len(candidates) * SPEED_ROUNDS, 0
-    for _ in range(SPEED_ROUNDS):
+    total, done = len(candidates) * rounds, 0
+    for _ in range(rounds):
         url, _ = github_release_url()
         host, path = url.split("/", 3)[2], "/" + url.split("/", 3)[3]
         for c in candidates:
@@ -283,16 +286,17 @@ def speed_test(candidates):
             except (OSError, ssl.SSLError, http.client.HTTPException):
                 speeds[c["ip"]].append(0.0)
             done += 1
-            progress("步驟 2/2：實際測試下載速度…", done, total)
+            progress(label, done, total)
     return speeds
 
 
 def rank(candidates, speeds):
     """依「順暢次數」→「速度中位數」→「延遲」排序。"""
     peak = max((v for vs in speeds.values() for v in vs), default=0)
+    threshold = max(peak * FAST_RATIO, FAST_FLOOR_MBPS)
     for c in candidates:
         vs = speeds.get(c["ip"], [])
-        c["fast"] = sum(1 for v in vs if peak and v >= peak * FAST_RATIO)
+        c["fast"] = sum(1 for v in vs if v >= threshold)
         c["median"] = statistics.median(vs) if vs else 0
         c["speeds"] = vs
     return sorted(candidates, key=lambda c: (-c["fast"], -c["median"], c["latency_ms"]))
@@ -386,7 +390,7 @@ def print_summary(result):
             print(f"\n  ・{name}：維持現狀")
         for line in r["reason"].split("\n"):
             print(f"      {line}")
-    print("\n  「順暢」＝速度達到這次測到最快速度的 30% 以上；卡住的路線通常只剩 1 Mbps 左右。")
+    print("\n  「順暢」＝速度達到這次測到最快速度的 30% 以上（且至少 3 Mbps）；卡住的路線通常只剩 1 Mbps 左右。")
 
 
 def print_details(result):
@@ -495,18 +499,18 @@ def flush_dns():
 
 # ---------------------------------------------------------------- 權限
 
-def _script_args(action, pause):
+def _script_args(action, pause, extra_args=()):
     """重新執行自己時的程式與參數（exe 或 .py 都適用）。"""
-    extra = [action] + (["--pause"] if pause else [])
+    extra = [action] + list(extra_args) + (["--pause"] if pause else [])
     if getattr(sys, "frozen", False):
         return sys.executable, extra
     return sys.executable, [os.path.abspath(__file__)] + extra
 
 
-def run_elevated(action):
+def run_elevated(action, extra_args=()):
     """以管理員 / root 身分執行同一個動作，等它結束。回傳是否有成功啟動。"""
     if not IS_WINDOWS:
-        exe, args = _script_args(action, pause=False)
+        exe, args = _script_args(action, pause=False, extra_args=extra_args)
         print("需要 root 權限，請輸入你的 Linux 登入密碼（輸入時畫面不會顯示）：")
         return subprocess.call(["sudo", exe] + args) == 0
     # Windows：跳出 UAC，開新視窗執行，等它關閉
@@ -521,7 +525,7 @@ def run_elevated(action):
                     ("lpClass", wintypes.LPCWSTR), ("hkeyClass", wintypes.HKEY), ("dwHotKey", wintypes.DWORD),
                     ("hIconOrMonitor", wintypes.HANDLE), ("hProcess", wintypes.HANDLE)]
 
-    exe, args = _script_args(action, pause=True)
+    exe, args = _script_args(action, pause=True, extra_args=extra_args)
     info = SHELLEXECUTEINFOW()
     info.cbSize = ctypes.sizeof(info)
     info.fMask = 0x40                     # SEE_MASK_NOCLOSEPROCESS：拿到 process handle 才能等它
@@ -558,6 +562,18 @@ def action_test(interactive=True):
     return result
 
 
+def write_routes(routes):
+    """routes：[(群組, IP, 節點代碼), ...]。整段取代本工具的設定，回傳備份檔路徑。"""
+    lines = [MARK_BEGIN, f"# applied {datetime.now():%Y-%m-%d %H:%M}"]
+    for group, ip, pop in routes:
+        lines.append(f"# {group['key']}: Fastly {pop}")
+        lines += [f"{ip}\t{h}" for h in group["hosts"]]
+    lines.append(MARK_END)
+    backup = write_hosts(strip_block(read_hosts()) + "\n" + "\n".join(lines) + "\n")
+    flush_dns()
+    return backup
+
+
 def action_apply(yes=False):
     if not is_admin():
         return 0 if run_elevated("apply") else 1
@@ -567,24 +583,115 @@ def action_apply(yes=False):
         write_hosts(strip_block(original))
         flush_dns()
     result = action_test(interactive=not yes)
-    lines = [MARK_BEGIN, f"# applied {datetime.now():%Y-%m-%d %H:%M}"]
-    for key in ("github", "x"):
-        r = result[key]
-        if r["apply"]:
-            lines.append(f"# {r['group']['key']}: Fastly {r['best']['pop']}")
-            lines += [f"{r['best']['ip']}\t{h}" for h in r["group"]["hosts"]]
-    lines.append(MARK_END)
-    if len(lines) <= 3:
+    routes = [(result[k]["group"], result[k]["best"]["ip"], result[k]["best"]["pop"])
+              for k in ("github", "x") if result[k]["apply"]]
+    if not routes:
         print("\n目前的路線已經很順，不需要修改，設定維持原狀。")
         return 0
     if not yes and not ask_yes("\n要套用上面建議的路線嗎？"):
         print("已取消，沒有修改任何設定。")
         return 0
-    backup = write_hosts(strip_block(read_hosts()) + "\n" + "\n".join(lines) + "\n")
-    flush_dns()
+    backup = write_routes(routes)
     print("\n✔ 已套用！之後 GitHub 下載 / X 圖片會走新的路線。")
     print(f"  （設定寫在 {HOSTS_PATH}，原始檔案備份在 {backup}）")
     print("  想恢復原狀，隨時選「還原」即可。")
+    return 0
+
+
+def find_region(text, regions):
+    """輸入地區代碼（ICN）或城市名稱（首爾），回傳可用的節點代碼；找不到回傳 None。"""
+    t = text.strip()
+    if t.upper() in regions:
+        return t.upper()
+    same_city = [pop for pop in regions if POP_NAMES.get(pop) == t]
+    return min(same_city, key=lambda pop: regions[pop][0]["latency_ms"]) if same_city else None
+
+
+def action_region(code=None):
+    """手動選擇地區：列出附近可用的地區，輸入代碼後在該地區挑最穩的線路。"""
+    print("\n正在尋找可用的地區（約 1 分鐘）…")
+    found, _, _ = scan(fastly_ranges(), label="尋找可用的地區…")
+    regions = {}
+    for r in found:
+        regions.setdefault(r["pop"], []).append(r)
+    regions.pop("?", None)
+    for ips in regions.values():
+        ips.sort(key=lambda r: r["latency_ms"])
+    if not regions:
+        print("找不到可用的地區（網路不通或被擋）。")
+        return 1
+    nearest = sorted(regions, key=lambda pop: regions[pop][0]["latency_ms"])
+    print("\n【附近可用的地區】（依延遲排序）")
+    for pop in nearest[:15]:
+        print(f"  {pop}  {pad(POP_NAMES.get(pop, ''), 10)}延遲約 {regions[pop][0]['latency_ms']:.0f} ms")
+    print(f"  …共 {len(regions)} 個地區，不在列表上的代碼也可以輸入")
+
+    if code is None:
+        code = input("\n請輸入地區代碼或城市名稱（例如 ICN 或 首爾），直接按 Enter 取消：").strip()
+        if not code:
+            print("已取消。")
+            return 0
+    pop = find_region(code, regions)
+    if not pop:
+        print(f"找不到「{code}」這個地區，或你的網路目前連不到那裡。")
+        return 1
+
+    # 同一個地區不同 IP 的穩定度差很多（實測東京有的 IP 每次都順、有的常卡），所以再挑一次
+    cands = regions[pop][:4]
+    print(f"\n測試 {place(pop)} 的 {len(cands)} 條線路（約 30 秒）…")
+    ranked = rank(cands, speed_test(cands, rounds=2, label="測試線路…"))
+    for c in ranked:
+        vs = " / ".join(f"{v:5.1f}" for v in c["speeds"])
+        print(f"  {c['ip']:<16}延遲 {c['latency_ms']:4.0f} ms  順暢 {c['fast']}/2  [{vs}] Mbps")
+    best = ranked[0]
+    if best["fast"] == 0 and not ask_yes(f"\n{place(pop)} 目前每條線路都卡住，仍要改走這裡嗎？", default=False):
+        print("已取消，沒有修改任何設定。")
+        return 0
+
+    # X 圖片：只採用 X 實際由這個地區出貨的線路
+    x = None
+    for c in ranked:
+        info = probe(X_IMAGES, same_24(c["ip"], X_IMAGES["suffix"]))
+        if info and info["pop"] == pop:
+            x = info
+            break
+    print(f"\n  {pad('GitHub 下載：', 14)}改走 {place(pop)}，使用 {best['ip']}")
+    if x:
+        print(f"  {pad('X 圖片：', 14)}改走 {place(pop)}，使用 {x['ip']}")
+    else:
+        print(f"  {pad('X 圖片：', 14)}X 在 {place(pop)} 沒有機房，維持系統原本的路線")
+    if not ask_yes("\n確定要套用嗎？"):
+        print("已取消，沒有修改任何設定。")
+        return 0
+    args = [f"github={best['ip']}:{pop}"] + ([f"x={x['ip']}:{pop}"] if x else [])
+    return action_set(args)
+
+
+def action_set(args):
+    """直接寫入指定的線路：set github=IP:代碼 [x=IP:代碼]（手動選地區提權後使用）。"""
+    groups = {"github": GITHUB, "x": X_IMAGES}
+    routes = []
+    for arg in args:
+        try:
+            key, rest = arg.split("=", 1)
+            ip, pop = rest.rsplit(":", 1)
+            ipaddress.IPv4Address(ip)
+            if key not in groups or not (len(pop) == 3 and pop.isalpha()):
+                raise ValueError
+        except ValueError:
+            print(f"參數格式錯誤：{arg}（應為 github=IP:代碼 或 x=IP:代碼）")
+            return 2
+        routes.append((groups[key], ip, pop.upper()))
+    if not routes:
+        print("沒有指定要寫入的線路。")
+        return 2
+    if not is_admin():
+        return 0 if run_elevated("set", args) else 1
+    backup = write_routes(routes)
+    print("\n✔ 已套用！")
+    for group, ip, pop in routes:
+        print(f"  {pad(group['name'] + '：', 14)}改走 {place(pop)}（{ip}）")
+    print(f"  （設定寫在 {HOSTS_PATH}，原始檔案備份在 {backup}）")
     return 0
 
 
@@ -618,6 +725,8 @@ HELP_TEXT = f"""
     2. 實際下載測試好幾次，看哪條路線最穩（約 2 分鐘）
     3. 把最穩的路線寫進電腦的 hosts 檔，讓電腦以後直接走那條路
 
+  也可以用「手動選擇地區」，輸入代碼（例如 ICN）或城市名稱（例如 首爾）指定要走哪裡。
+
   好路線會隨網路業者調整而改變，覺得又變慢時重新「套用」一次就好。
   換到其他網路（例如筆電帶出門）覺得變慢，先「還原」。
 
@@ -646,11 +755,12 @@ def menu():
             print_status(st)
         print(f"""
 【請選擇】
-  1. 測試      找出目前最順的路線，只測試、不改設定（約 3 分鐘）
-  2. 套用      測試後，把最順的路線設定到電腦上（需要管理員權限）
-  3. 還原      移除本工具的設定，回到原本的狀態
-  4. 重新整理  重新檢查目前狀況
-  5. 說明      這個工具在做什麼
+  1. 測試          找出目前最順的路線，只測試、不改設定（約 3 分鐘）
+  2. 自動套用      測試後，把最順的路線設定到電腦上（需要管理員權限）
+  3. 手動選擇地區  輸入代碼（例如 ICN）或城市名稱，指定要走哪裡
+  4. 還原          移除本工具的設定，回到原本的狀態
+  5. 重新整理      重新檢查目前狀況
+  6. 說明          這個工具在做什麼
   0. 離開""")
         choice = input("\n請輸入數字：").strip()
         try:
@@ -660,17 +770,20 @@ def menu():
                 action_apply()
                 st = None
             elif choice == "3":
-                action_restore()
+                action_region()
                 st = None
             elif choice == "4":
+                action_restore()
+                st = None
+            elif choice == "5":
                 st = None
                 continue
-            elif choice == "5":
+            elif choice == "6":
                 print(HELP_TEXT)
             elif choice == "0":
                 return 0
             else:
-                print("請輸入 0～5 的數字。")
+                print("請輸入 0～6 的數字。")
                 continue
         except PermissionError as e:
             print(f"\n寫入失敗，沒有權限：{e}")
@@ -684,7 +797,8 @@ def main(argv):
     pause = "--pause" in argv
     yes = "--yes" in argv
     cmds = {"test": lambda: (action_test(interactive=False), 0)[1], "apply": lambda: action_apply(yes),
-            "restore": action_restore, "status": action_status}
+            "region": lambda: action_region(args[1] if len(args) > 1 else None),
+            "set": lambda: action_set(args[1:]), "restore": action_restore, "status": action_status}
     if args and args[0] not in cmds:
         print(__doc__)
         return 2
