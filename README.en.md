@@ -2,23 +2,23 @@
 
 English | [繁體中文](README.md)
 
-Automatically finds the most stable nearby Fastly route to speed up **GitHub downloads** and **X (Twitter) images**. Works on Windows and Linux, in English and Chinese, through a simple numbered menu.
+Automatically finds the most stable nearby Fastly route to speed up **GitHub downloads**, **X (Twitter) images** and **Twitch pages & images**. Works on Windows and Linux, in English and Chinese, through a simple numbered menu.
 
 ## Why
 
-GitHub release downloads, raw files and X images are delivered by the CDN Fastly from data centers around the world. Your ISP picks one for you automatically, but that route is not always smooth.
+GitHub release downloads, raw files, X images and Twitch pages, images and emotes are delivered by the CDN Fastly from data centers around the world. Your ISP picks one for you automatically, but that route is not always smooth.
 
 Measured on Chunghwa Telecom (HiNet, Taiwan):
 
 | Route | Downloads during evening peak hours |
 |---|---|
-| System default: Singapore (SIN) | almost always stuck below 1 Mbps |
+| System default: Singapore (SIN) | GitHub and Twitch almost always stuck below 1 Mbps |
 | Route found by this tool: Seoul (ICN) | full line speed every time |
 
 This tool:
 
 1. Finds usable Fastly nodes near you; anything 60 ms slower than the nearest one is skipped (about 15 s)
-2. Downloads test data in several rounds to see which route is the most stable (1-2 min)
+2. Downloads test data in several rounds to see which route is the most stable (about 1.5 min per service)
 3. Writes the most stable route into your hosts file so your computer uses it from then on
 
 Good routes change as ISPs adjust their routing, so every run tests again; no IP is hard-coded.
@@ -39,7 +39,7 @@ Good routes change as ISPs adjust their routing, so every run tests again; no IP
   This tool:          not applied (system default route)
 
 [Menu]
-  1. Test            Find the smoothest route; test only, nothing changes (~2 min)
+  1. Test            Find the smoothest route; test only, nothing changes (~4 min)
   2. Auto apply      Test, then set the smoothest route (needs administrator)
   3. Choose region   Scan, list nearby regions, then pick where to go
   4. Restore         Remove this tool's settings and go back to the original
@@ -48,6 +48,7 @@ Good routes change as ISPs adjust their routing, so every run tests again; no IP
   7. Update          Check GitHub for a new version
   8. Node latency    List the latency of all nodes, 10 per page
   9. Delete          Delete all data from this tool and go back to the original
+  S. Services        Choose what to speed up (GitHub, X images, Twitch)
   L. Language        Switch to Chinese (中文)
   h. Help            What this tool does
   0. Exit
@@ -68,6 +69,18 @@ sh linux/install.sh
 A **fastly-hosts** icon appears on the desktop and in the application menu; double-click it to open the same menu. When you apply or restore, it asks for your login password (sudo) in the same window.
 
 You can also run it directly: `python3 fastly_hosts.py`
+
+### Which services to speed up
+
+Press `S` in the menu to choose; all are on by default. If you don't use Twitch, turning it off cuts the test from about 4 to about 2 minutes.
+
+| Service | Domains |
+|---|---|
+| GitHub downloads | `release-assets.githubusercontent.com`, `raw.githubusercontent.com` |
+| X images | `pbs.twimg.com` |
+| Twitch pages & images | `www.twitch.tv`, `gql.twitch.tv`, `static-cdn.jtvnw.net`, `assets.twitch.tv`, `k.twitchcdn.net` |
+
+**Twitch limitation**: only pages, images, emotes and site data are on Fastly, so this helps with pages that keep spinning, slow images and slow channel switching. **The live video and chat** run on Twitch's own servers and AWS, which this tool cannot change.
 
 ### Language
 
@@ -90,7 +103,7 @@ If you don't want the automatic pick:
   ...
 ```
 
-Enter a code (`ICN`) or a city name (`Seoul`) to switch there. A region usually has several routes; the tool tests up to 8 and picks the most stable one. If X has no node in that region (e.g. Hong Kong), X images keep the system default route.
+Enter a code (`ICN`) or a city name (`Seoul`) to switch there. Each service is tested separately in that region (up to 8 routes) and the most stable route is picked. If a service has no node in that region (e.g. X in Hong Kong), it keeps the system default route.
 
 Distant regions are skipped. If you really want one (e.g. `LAX`), enter its code and the tool will offer a full worldwide scan (about 1.5 min).
 
@@ -99,7 +112,7 @@ To see the latency of every region (about 100), use "8. Node latency": 10 per pa
 ### Update and delete
 
 - **7. Update**: checks this project's GitHub Releases. If there is a new version it asks before updating; reopen the program afterwards. The Windows version verifies the SHA256 checksum listed in the release notes and cancels on mismatch
-- **9. Delete**: deletes all data from this tool (hosts entries, hosts backup, scan record, language setting) and goes back to the original route. It lists everything first and asks you to confirm. The program itself is not deleted
+- **9. Delete**: deletes all data from this tool (hosts entries, hosts backup, scan record, language and service settings) and goes back to the original route. It lists everything first and asks you to confirm. The program itself is not deleted
 
 ### Command line (advanced)
 
@@ -121,18 +134,14 @@ On Windows, use `fastly-hosts.exe` with the same arguments.
 ## FAQ
 
 **What does it change on my computer?**
-Only a small, marked block in the hosts file (Windows: `C:\Windows\System32\drivers\etc\hosts`, Linux: `/etc/hosts`), affecting only:
-
-- `release-assets.githubusercontent.com`
-- `raw.githubusercontent.com`
-- `pbs.twimg.com`
+Only a small, marked block in the hosts file (Windows: `C:\Windows\System32\drivers\etc\hosts`, Linux: `/etc/hosts`), affecting only the domains of the services you have turned on (see the table above).
 
 "Restore" removes that block completely and leaves everything else untouched. Before the first change, the original file is backed up as `hosts.fastly-hosts.bak`.
 
-The last scan result and the language setting are stored in `%LOCALAPPDATA%\fastly-hosts\` (Windows) or `~/.cache/fastly-hosts/` (Linux). "9. Delete" removes all of it.
+The last scan result and your language and service settings are stored in `%LOCALAPPDATA%\fastly-hosts\` (Windows) or `~/.cache/fastly-hosts/` (Linux). "9. Delete" removes all of it.
 
 **How much data does a test use?**
-About 300 MB per run (only the first few MB of a file are downloaded per sample; nothing is saved).
+About 360 MB per run with all services on (GitHub ~300 MB, Twitch ~60 MB; only the first few MB of a file are downloaded per sample, nothing is saved).
 
 **When should I apply again?**
 When GitHub downloads feel slow again. If you move to another network (e.g. a laptop on the go) and it feels slow, restore first.
@@ -159,10 +168,10 @@ It works on any network; tests are based on the nodes nearest to you. So far, th
 
 ## How it works
 
-GitHub and X files are served by Fastly, and some Fastly IP ranges always lead to a specific data center. The tool:
+GitHub, X and Twitch files are served by Fastly, and some Fastly IP ranges always lead to a specific data center. Each customer has its own set of IP blocks and a fixed last octet (GitHub `.133`, X `.159`, Twitch `.214`), so each service is scanned separately. The tool:
 
-1. Fetches all IP ranges from [Fastly's official IP list](https://api.fastly.com/public-ip-list) (about 1,200 /24 blocks), picks one IP per block and first measures only latency. Anything 60 ms slower than the nearest node is skipped; the nearby ones are fully checked with GitHub's domain to confirm they serve the content, recording data center and latency
-2. Runs 3 interleaved speed-test rounds on the 10 lowest-latency routes plus the system default. A congested route usually crawls at about 1 Mbps from the start, so what counts is how often a route is smooth, not its single best speed ("smooth" = at least 30% of the fastest speed in that test, and at least 3 Mbps)
+1. Fetches all IP ranges from [Fastly's official IP list](https://api.fastly.com/public-ip-list) (about 1,200 /24 blocks), picks one IP per block and first measures only latency. Anything 60 ms slower than the nearest node is skipped; the nearby ones are fully checked with each service's own domain to confirm they serve the content, recording data center and latency
+2. Runs 3 interleaved speed-test rounds per service on the 10 lowest-latency routes plus the system default (a GitHub release file for GitHub, a page script for Twitch). A congested route usually crawls at about 1 Mbps from the start, so what counts is how often a route is smooth, not its single best speed ("smooth" = at least 30% of the fastest speed in that test, and at least 3 Mbps)
 3. X images are too small to measure speed, so the GitHub result for the same route is used. X is not deployed in every data center, so only routes where X is actually served from that same data center are used
 
 Python standard library only, no third-party packages.

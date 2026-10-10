@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""fastly-hosts: find the most stable nearby Fastly route for GitHub downloads and X (Twitter) images.
-fastly-hosts：自動找出附近最順的 Fastly 路線，加速 GitHub 下載與 X 圖片。
+"""fastly-hosts: find the most stable nearby Fastly route for GitHub downloads, X (Twitter) images and Twitch.
+fastly-hosts：自動找出附近最順的 Fastly 路線，加速 GitHub 下載、X 圖片與 Twitch。
 
 Run without arguments for the menu. / 直接執行會出現選單。
 
@@ -39,7 +39,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 IS_WINDOWS = platform.system() == "Windows"
 HOSTS_PATH = (os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "drivers", "etc", "hosts")
               if IS_WINDOWS else "/etc/hosts")
@@ -49,24 +49,41 @@ MARK_END = "# <<< fastly-hosts <<<"
 USER_AGENT = f"fastly-hosts/{VERSION}"
 REPO = "AFAlimru/fastly-hosts-adjust"          # 檢查更新用
 
-# GitHub 用 Fastly IP 尾碼 .133、X 圖片用 .159（同一個 /24 走同一條路線）
+# ---------------------------------------------------------------- 服務
+# Fastly 上每個客戶用固定的 IP 尾碼（GitHub .133、X 圖片 .159、Twitch .214），同一個 /24 走同一條路線。
+# hosts：要寫進 hosts 的 (網域, 尾碼)；probe：確認路線能用的 (網域, 路徑, 尾碼)；
+# pop_probe：probe 的回應沒有節點資訊時，改用同一個 /24 的這個網域判斷節點；
+# speed：測速方式；via：沒有自己的路線，沿用另一個服務的路線（X 圖片太小測不出速度，沿用 GitHub 的測速結果）
 GITHUB = {
-    "name": ("GitHub 下載", "GitHub downloads"),
     "key": "github",
-    "hosts": ["release-assets.githubusercontent.com", "raw.githubusercontent.com"],
-    "suffix": 133,
-    "probe_host": "raw.githubusercontent.com",
-    "probe_path": "/github/gitignore/main/README.md",
+    "name": ("GitHub 下載", "GitHub downloads"),
+    "hosts": [("release-assets.githubusercontent.com", 133), ("raw.githubusercontent.com", 133)],
+    "probe": ("raw.githubusercontent.com", "/github/gitignore/main/README.md", 133),
+    "pop_probe": None,
+    "speed": "github",
 }
 X_IMAGES = {
+    "key": "x",
     "name": ("X 圖片", "X images"),
-    "key": "x-images",
-    "hosts": ["pbs.twimg.com"],
-    "suffix": 159,
-    "probe_host": "pbs.twimg.com",
-    "probe_path": "/profile_images/1683325380441128960/yRsRRjGO_400x400.jpg",
+    "hosts": [("pbs.twimg.com", 159)],
+    "probe": ("pbs.twimg.com", "/profile_images/1683325380441128960/yRsRRjGO_400x400.jpg", 159),
+    "pop_probe": None,
+    "via": "github",
 }
-GROUPS = [GITHUB, X_IMAGES]
+# Twitch 只有網頁、圖片、表情符號、網站資料在 Fastly 上；直播影片和聊天室在 Twitch 自己的機房與 AWS，改不到。
+# Twitch 在 Fastly 上用的是另一批 IP 段（GitHub 的路線不提供 Twitch），所以要另外掃描。
+TWITCH = {
+    "key": "twitch",
+    "name": ("Twitch 網頁與圖片", "Twitch pages & images"),
+    "hosts": [("www.twitch.tv", 214), ("gql.twitch.tv", 214), ("static-cdn.jtvnw.net", 214),
+              ("assets.twitch.tv", 214), ("k.twitchcdn.net", 167)],
+    "probe": ("static-cdn.jtvnw.net", "/jtv_user_pictures/xarth/404_user_70x70.png", 214),
+    "pop_probe": ("k.twitchcdn.net", "/", 167),   # static-cdn 的回應沒有 x-served-by
+    "speed": "twitch",
+}
+SERVICES = [GITHUB, X_IMAGES, TWITCH]
+TESTED = [GITHUB, TWITCH]                         # 有自己的路線、會掃描和測速的服務
+BY_KEY = {s["key"]: s for s in SERVICES}
 
 # Fastly 節點代碼 → 城市（中文, 英文）
 POP_NAMES = {
@@ -120,7 +137,7 @@ REGION_MAX_IPS = 8          # 指定地區時最多測幾條線路（同地區�
 # 實測（HiNet 晚上）：塞住的路線是「連線一開始就卡在 1 Mbps 以下」，
 # 同一個 IP 有時快有時卡，所以多輪交錯測、看順暢的比例，不看單次速度。
 SPEED_ROUNDS = 3
-SPEED_SAMPLE_SECONDS = 3
+SPEED_SAMPLE_SECONDS = 2   # 卡住的線路一開始就只有 1 Mbps 左右，2 秒足以判斷
 SPEED_SAMPLE_BYTES = 8 << 20  # 每次最多 8 MB，快的路線不到一秒就結束，控制總流量
 FAST_RATIO = 0.3            # 速度達到本次測到最快值的 30% 才算「順暢」
 FAST_FLOOR_MBPS = 3.0       # 而且至少 3 Mbps：實測卡住時是 0.3～2.3 Mbps；
@@ -136,8 +153,8 @@ LANG = "zh"
 
 
 def L(zh, en):
-    """依目前語言回傳中文或英文。英文用 ...，「…」在部分英文主控台的字碼頁會變成亂碼。"""
-    return zh if LANG == "zh" else en.replace("…", "...")
+    """依目前語言回傳中文或英文。英文版改用 ASCII（... 和 OK）：「…」「✔」在部分英文主控台會變成亂碼或問號。"""
+    return zh if LANG == "zh" else en.replace("…", "...").replace("✔", "OK")
 
 
 def detect_lang():
@@ -152,8 +169,8 @@ def detect_lang():
     return "zh" if env.lower().startswith("zh") else "en"
 
 
-def gname(group):
-    return L(*group["name"])
+def sname(svc):
+    return L(*svc["name"])
 
 
 def place(pop):
@@ -161,7 +178,9 @@ def place(pop):
     if pop in POP_NAMES:
         zh, en = POP_NAMES[pop]
         return L(f"{zh}（{pop}）", f"{en} ({pop})")
-    return pop or "?"
+    if not pop or pop == "?":
+        return L("節點不明", "unknown node")
+    return pop
 
 
 def city(pop):
@@ -184,11 +203,22 @@ def progress(label, done, total):
 
 # ---------------------------------------------------------------- 資料檔（掃描紀錄、設定）
 
+def _home():
+    # Linux 用 sudo 執行時讀「原本使用者」的資料夾，才讀得到使用者的語言與服務設定
+    if not IS_WINDOWS and os.geteuid() == 0 and os.environ.get("SUDO_USER"):
+        try:
+            import pwd
+            return pwd.getpwnam(os.environ["SUDO_USER"]).pw_dir
+        except (ImportError, KeyError):
+            pass
+    return os.path.expanduser("~")
+
+
 def data_dir():
     if IS_WINDOWS:
-        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        base = os.environ.get("LOCALAPPDATA") or _home()
     else:
-        base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+        base = os.environ.get("XDG_CACHE_HOME") or os.path.join(_home(), ".cache")
     return os.path.join(base, "fastly-hosts")
 
 
@@ -201,7 +231,7 @@ def config_path():
 
 
 def _can_write_user_data():
-    # Linux 用 sudo 執行時不寫：避免在 /root 或使用者資料夾留下 root 擁有的檔案
+    # Linux 用 sudo 執行時不寫：避免在使用者資料夾留下 root 擁有的檔案
     return IS_WINDOWS or os.geteuid() != 0
 
 
@@ -225,24 +255,46 @@ def _read_json(path):
 
 
 def save_scan(found, scanned, near_only):
+    """found：{服務代碼: [路線資訊]}。"""
     _write_json(cache_path(), {"time": f"{datetime.now():%Y-%m-%d %H:%M}", "scanned": scanned,
                                "near_only": near_only, "found": found})
 
 
 def load_scan():
     data = _read_json(cache_path())
-    return data if data and data.get("found") else None
+    if not data or not data.get("found"):
+        return None
+    if isinstance(data["found"], list):          # 0.7.0 以前的格式：只有 GitHub
+        data["found"] = {"github": data["found"]}
+    return data
+
+
+def load_config():
+    return _read_json(config_path()) or {}
+
+
+def save_config(**changes):
+    data = load_config()
+    data.update(changes)
+    _write_json(config_path(), data)
 
 
 def load_lang_setting():
-    data = _read_json(config_path()) or {}
-    return data.get("lang") if data.get("lang") in ("zh", "en") else None
+    lang = load_config().get("lang")
+    return lang if lang in ("zh", "en") else None
 
 
-def save_lang_setting(lang):
-    data = _read_json(config_path()) or {}
-    data["lang"] = lang
-    _write_json(config_path(), data)
+def enabled(svc):
+    return load_config().get("services", {}).get(svc["key"], True)
+
+
+def enabled_services():
+    return [s for s in SERVICES if enabled(s)]
+
+
+def scan_keys(services):
+    """要掃描哪些服務的路線：X 圖片沿用 GitHub 的路線。"""
+    return [s["key"] for s in TESTED if s in services or any(x.get("via") == s["key"] for x in services)]
 
 
 # ---------------------------------------------------------------- 網路量測
@@ -255,8 +307,8 @@ def resolve_system(host):
         return []
 
 
-def https_get(host, path, ip, method="GET", max_bytes=0, max_seconds=0.0, timeout=None):
-    """直接連到指定 IP、但用正確網域做 TLS（SNI）和 Host，回傳量測結果。"""
+def https_get(host, path, ip, method="GET", max_bytes=0, max_seconds=0.0, timeout=None, keep_body=False):
+    """直接連到指定 IP、但用正確網域做 TLS（SNI）和 Host，回傳量測結果（keep_body=True 時附上內容）。"""
     timeout = timeout or TIMEOUT
     result = {"ip": ip, "ok": False}
     t0 = time.perf_counter()
@@ -271,13 +323,15 @@ def https_get(host, path, ip, method="GET", max_bytes=0, max_seconds=0.0, timeou
         resp = conn.getresponse()
         result["status"] = resp.status
         result["served_by"] = resp.getheader("x-served-by", "")
-        got, t_start = 0, time.perf_counter()
+        got, t_start, body = 0, time.perf_counter(), bytearray()
         if method == "GET":
             while True:
                 chunk = resp.read(256 * 1024)
                 if not chunk:
                     break
                 got += len(chunk)
+                if keep_body:
+                    body += chunk
                 elapsed = time.perf_counter() - t_start
                 if (max_bytes and got >= max_bytes) or (max_seconds and elapsed >= max_seconds):
                     break
@@ -285,6 +339,8 @@ def https_get(host, path, ip, method="GET", max_bytes=0, max_seconds=0.0, timeou
         result["bytes"] = got
         result["mbps"] = got * 8 / elapsed / 1e6
         result["ok"] = 200 <= resp.status < 400
+        if keep_body:
+            result["body"] = bytes(body)
     finally:
         conn.close()
     return result
@@ -314,14 +370,30 @@ def pop_of(served_by):
     return "?"
 
 
-def probe(group, ip, tries=1, timeout=None):
-    """用該組網域對 IP 發 HEAD：確認憑證與內容正確，回傳節點與延遲；失敗回傳 None。"""
+def same_24(ip, suffix):
+    """同一個 /24 換成另一個尾碼，例如 146.75.48.133 → 146.75.48.159。"""
+    return ".".join(ip.split(".")[:3] + [str(suffix)])
+
+
+def probe(svc, ip, tries=1, timeout=None):
+    """用該服務的網域對 IP 發 HEAD：確認憑證與內容正確，回傳節點與延遲；失敗回傳 None。
+    ip 可以是同一個 /24 的任何尾碼，會自動換成該服務的尾碼。"""
+    host, path, sfx = svc["probe"]
+    ip = same_24(ip, sfx)
     try:
         lat = tcp_latency(ip, tries=tries, timeout=timeout)
-        r = https_get(group["probe_host"], group["probe_path"], ip, method="HEAD", timeout=timeout)
+        r = https_get(host, path, ip, method="HEAD", timeout=timeout)
         if lat is None or not r["ok"]:
             return None
-        return {"ip": ip, "pop": pop_of(r.get("served_by")), "latency_ms": lat}
+        pop = pop_of(r.get("served_by"))
+        if svc.get("pop_probe"):
+            phost, ppath, psfx = svc["pop_probe"]
+            try:
+                pop = pop_of(https_get(phost, ppath, same_24(ip, psfx), method="HEAD", timeout=timeout)
+                             .get("served_by"))
+            except (OSError, ssl.SSLError, http.client.HTTPException):
+                pop = "?"
+        return {"ip": ip, "pop": pop, "latency_ms": lat}
     except (OSError, ssl.SSLError, http.client.HTTPException):
         return None
 
@@ -354,10 +426,52 @@ def github_release_url():
             data = json.loads(conn.getresponse().read())
             conn.close()
             asset = max(data["assets"], key=lambda a: a["size"])
-            return _follow_to_githubusercontent(asset["browser_download_url"]), asset["name"]
+            return _follow_to_githubusercontent(asset["browser_download_url"])
         except Exception as e:
             last_error = e
-    raise RuntimeError(L(f"拿不到測速檔案：{last_error}", f"cannot get a speed-test file: {last_error}"))
+    raise RuntimeError(L(f"拿不到 GitHub 測速檔案：{last_error}", f"cannot get a GitHub speed-test file: {last_error}"))
+
+
+_twitch_url = None
+
+
+def _twitch_homepage(candidates):
+    """抓 Twitch 首頁。系統預設路線常常正是卡住的那條（實測連首頁都逾時），
+    所以先透過延遲最低的幾條候選路線抓，都失敗才走系統預設。"""
+    for c in sorted(candidates, key=lambda c: c["latency_ms"])[:5]:
+        try:
+            r = https_get("www.twitch.tv", "/", same_24(c["ip"], 214), max_seconds=8, timeout=5, keep_body=True)
+            if r["ok"] and r["body"]:
+                return r["body"].decode("utf-8", "replace")
+        except (OSError, ssl.SSLError, http.client.HTTPException):
+            pass
+    req = urllib.request.Request("https://www.twitch.tv/", headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return r.read().decode("utf-8", "replace")
+
+
+def twitch_asset_url(candidates=()):
+    """Twitch 首頁引用的網頁程式檔（assets.twitch.tv）。最大的約 1.8 MB，足夠分辨順暢和卡住：
+    順暢的路線不到半秒下載完，卡住的路線 2 秒內只能下載一點點。檔名帶雜湊會隨改版變動，每次執行重新找。"""
+    global _twitch_url
+    if _twitch_url:
+        return _twitch_url
+    html = _twitch_homepage(candidates)
+    urls = sorted(set(re.findall(r'https://assets\.twitch\.tv/assets/[^"\'\s>]+\.js', html)))
+    if not urls:
+        raise RuntimeError(L("Twitch 首頁找不到測速檔案", "no speed-test file found on the Twitch homepage"))
+    # 目前最大的是 nomodulePolyfills 和 core；都找不到就用第一個
+    for name in ("nomodulePolyfills", "core-"):
+        pick = next((u for u in urls if name in u), None)
+        if pick:
+            _twitch_url = pick
+            return pick
+    _twitch_url = urls[0]
+    return _twitch_url
+
+
+def speed_url(svc, candidates=()):
+    return github_release_url() if svc["speed"] == "github" else twitch_asset_url(candidates)
 
 
 def fastly_ranges():
@@ -369,97 +483,96 @@ def fastly_ranges():
         return FALLBACK_RANGES
 
 
-def same_24(ip, suffix):
-    """同一個 /24 換成另一個尾碼，例如 146.75.48.133 → 146.75.48.159。"""
-    return ".".join(ip.split(".")[:3] + [str(suffix)])
-
-
-def _all_probe_ips(ranges):
+def _all_blocks(ranges):
+    """所有 /24 的代表 IP（尾碼 .1，只用來量延遲；各服務檢查時會換成自己的尾碼）。"""
     ips = []
     for cidr in ranges:
         net = ipaddress.ip_network(cidr, strict=False)
         subs = net.subnets(new_prefix=24) if net.prefixlen < 24 else [net]
-        ips += [same_24(str(s.network_address), GITHUB["suffix"]) for s in subs]
+        ips += [same_24(str(s.network_address), 1) for s in subs]
     return ips
 
 
-def scan(label, near_only=True):
-    """每個 /24 挑一個 IP 檢查。回傳 {"found": [IP 資訊（依延遲排序）], "scanned": 總數, "skipped": 略過的遠方數量}。
-    near_only=True：先只量延遲，比最近的慢 NEAR_MARGIN_MS 以上的略過，只對附近的做完整檢查。"""
-    ips = _all_probe_ips(fastly_ranges())
+def scan(label, keys, near_only=True):
+    """掃描各服務能用的路線。回傳 {"found": {服務代碼: [路線（依延遲排序）]}, "scanned": /24 總數,
+    "skipped": 略過的遠方 /24 數量}。
+    near_only=True：先只量延遲（所有服務共用），比最近的慢 NEAR_MARGIN_MS 以上的略過，只對附近的做完整檢查。"""
+    blocks = _all_blocks(fastly_ranges())
+    keys = list(keys)
+    found = {k: [] for k in keys}
+    skipped = 0
     if near_only:
-        # 第一階段：只量延遲（0～80%）
+        # 第一階段：只量延遲（0～70%）
         lat = {}
         with ThreadPoolExecutor(max_workers=PRECHECK_WORKERS) as pool:
-            futures = {pool.submit(tcp_latency, ip, 1, PRECHECK_TIMEOUT): ip for ip in ips}
+            futures = {pool.submit(tcp_latency, same_24(b, 133), 1, PRECHECK_TIMEOUT): b for b in blocks}
             for done, fut in enumerate(as_completed(futures), 1):
                 if fut.result():
                     lat[futures[fut]] = fut.result()
                 if done % 32 == 0:
-                    progress(label, done * 80 // len(ips), 100)
+                    progress(label, done * 70 // len(blocks), 100)
         if not lat:
             progress(label, 100, 100)
-            return {"found": [], "scanned": len(ips), "skipped": 0}
+            return {"found": found, "scanned": len(blocks), "skipped": 0}
         cutoff = min(lat.values()) + NEAR_MARGIN_MS + PRECHECK_SLACK_MS
-        targets = [ip for ip, ms in lat.items() if ms <= cutoff]
-        # 第二階段：附近的才做完整檢查（80～100%），延遲量 3 次比較準
-        found = []
+        targets = [b for b, ms in lat.items() if ms <= cutoff]
+        skipped = len(blocks) - len(targets)
+        tries, workers, start, share = 3, 16, 70, 30
+    else:
+        targets, tries, workers, start, share = blocks, 1, SCAN_WORKERS, 0, 80
+    # 第二階段：各服務用自己的網域檢查
+    jobs = [(k, b) for k in keys for b in targets]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(probe, BY_KEY[k], b, tries, SCAN_TIMEOUT): k for k, b in jobs}
+        for done, fut in enumerate(as_completed(futures), 1):
+            if fut.result():
+                found[futures[fut]].append(fut.result())
+            if done % 8 == 0 or done == len(jobs):
+                progress(label, start + done * share // max(len(jobs), 1), 100)
+    if not near_only:
+        # 完整掃描時同時連線多、延遲不準：每條路線再各量 3 次（80～100%）
+        routes = [r for k in keys for r in found[k]]
         with ThreadPoolExecutor(max_workers=16) as pool:
-            futures = [pool.submit(probe, GITHUB, ip, 3, SCAN_TIMEOUT) for ip in targets]
+            futures = {pool.submit(tcp_latency, r["ip"], 3, SCAN_TIMEOUT): r for r in routes}
             for done, fut in enumerate(as_completed(futures), 1):
                 if fut.result():
-                    found.append(fut.result())
-                progress(label, 80 + done * 20 // len(futures), 100)
-        if found:
-            nearest = min(r["latency_ms"] for r in found)
-            found = [r for r in found if r["latency_ms"] <= nearest + NEAR_MARGIN_MS]
-        found.sort(key=lambda r: r["latency_ms"])
-        return {"found": found, "scanned": len(ips), "skipped": len(lat) - len(found)}
-
-    # 完整掃描：全部做完整檢查，再把每個 IP 的延遲各量 3 次（同時量的數量少，比較準）
-    found = []
-    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
-        futures = [pool.submit(probe, GITHUB, ip, 1, SCAN_TIMEOUT) for ip in ips]
-        for done, fut in enumerate(as_completed(futures), 1):
-            if fut.result():
-                found.append(fut.result())
-            if done % 24 == 0 or done == len(futures):
-                progress(label, done * 80 // len(futures), 100)
-    with ThreadPoolExecutor(max_workers=16) as pool:
-        futures = {pool.submit(tcp_latency, r["ip"], 3, SCAN_TIMEOUT): r for r in found}
-        for done, fut in enumerate(as_completed(futures), 1):
-            if fut.result():
-                futures[fut]["latency_ms"] = fut.result()
-            progress(label, 80 + done * 20 // max(len(futures), 1), 100)
-    if not found:
-        progress(label, 100, 100)
-    found.sort(key=lambda r: r["latency_ms"])
-    return {"found": found, "scanned": len(ips), "skipped": 0}
+                    futures[fut]["latency_ms"] = fut.result()
+                progress(label, 80 + done * 20 // max(len(routes), 1), 100)
+        if not routes:
+            progress(label, 100, 100)
+    for k in keys:
+        rs = found[k]
+        if near_only and rs:
+            nearest = min(r["latency_ms"] for r in rs)
+            rs[:] = [r for r in rs if r["latency_ms"] <= nearest + NEAR_MARGIN_MS]
+        rs.sort(key=lambda r: r["latency_ms"])
+    return {"found": found, "scanned": len(blocks), "skipped": skipped}
 
 
-def scan_cached(label, near_only=True):
-    result = scan(label, near_only)
+def scan_cached(label, keys, near_only=True):
+    result = scan(label, keys, near_only)
     save_scan(result["found"], result["scanned"], near_only)
     return result
 
 
 def regions_from(found):
-    """掃描結果依地區分組：{節點代碼: [IP 資訊（依延遲排序）]}。"""
+    """路線依地區分組：{節點代碼: [路線（依延遲排序）]}。found 可以是清單或 {服務: 清單}。"""
+    routes = found if isinstance(found, list) else [r for rs in found.values() for r in rs]
     regions = {}
-    for r in found:
+    for r in routes:
         if r.get("pop") and r["pop"] != "?":
             regions.setdefault(r["pop"], []).append(r)
-    for ips in regions.values():
-        ips.sort(key=lambda r: r["latency_ms"])
+    for rs in regions.values():
+        rs.sort(key=lambda r: r["latency_ms"])
     return regions
 
 
-def speed_test(candidates, label, rounds=SPEED_ROUNDS):
+def speed_test(svc, candidates, label, rounds=SPEED_ROUNDS):
     """多輪交錯測速。回傳 {ip: [Mbps, ...]}。"""
     speeds = {c["ip"]: [] for c in candidates}
     total, done = len(candidates) * rounds, 0
     for _ in range(rounds):
-        url, _ = github_release_url()
+        url = speed_url(svc, candidates)
         host, path = url.split("/", 3)[2], "/" + url.split("/", 3)[3]
         for c in candidates:
             try:
@@ -473,7 +586,7 @@ def speed_test(candidates, label, rounds=SPEED_ROUNDS):
 
 
 def rank(candidates, speeds):
-    """依「順暢次數」→「速度中位數」→「延遲」排序。"""
+    """依「順暢次數」→「速度中位數」→「延遲」排序。沒有測速資料時只看延遲。"""
     peak = max((v for vs in speeds.values() for v in vs), default=0)
     threshold = max(peak * FAST_RATIO, FAST_FLOOR_MBPS)
     for c in candidates:
@@ -484,103 +597,138 @@ def rank(candidates, speeds):
     return sorted(candidates, key=lambda c: (-c["fast"], -c["median"], c["latency_ms"]))
 
 
-def analyze():
-    """掃描附近節點 + 測速 + 判斷。回傳 GitHub 與 X 圖片各自的建議。"""
-    has_block = bool(current_block(read_hosts()))
-    base_word = L("目前設定", "Current setting") if has_block else L("目前路線", "Current route")
-    sc = scan_cached(L("步驟 1/2：尋找附近的節點…", "Step 1/2: finding nearby nodes…"))
-    top = sc["found"]
-    if not top:
-        fail = {"best": None, "apply": False,
-                "reason": L("找不到可用的節點（網路不通或被擋）", "No usable node found (network down or blocked)")}
-        return {"github": dict(fail, group=GITHUB), "x": dict(fail, group=X_IMAGES), "ranked": [], **sc}
+def smooth_text(n, total=SPEED_ROUNDS):
+    return L(f"{total} 次測試有 {n} 次順暢", f"smooth in {n} of {total} tests")
 
-    # 測速對象：延遲最低的幾個 + GitHub 目前用的 IP + X 圖片目前用的 IP 所在的路線
-    base_gh = resolve_system(GITHUB["probe_host"])
-    base_x = resolve_system(X_IMAGES["probe_host"])
-    cands = {c["ip"]: c for c in top[:SPEED_TOP_N]}
-    for ip in base_gh + [same_24(ip, GITHUB["suffix"]) for ip in base_x]:
+
+def evaluate(svc, found, base_word, extra_base=(), step=""):
+    """一個有自己路線的服務：延遲最低的幾條 + 目前用的路線一起測速，判斷要不要換。"""
+    base_ips = [same_24(ip, svc["probe"][2]) for ip in resolve_system(svc["probe"][0])]
+    cands = {c["ip"]: c for c in found[:SPEED_TOP_N]}
+    for ip in base_ips + [same_24(ip, svc["probe"][2]) for ip in extra_base]:
         if ip not in cands:
-            info = probe(GITHUB, ip)
+            info = probe(svc, ip)
             if info:
                 cands[ip] = info
     cands = list(cands.values())
-    ranked = rank(cands, speed_test(cands, L("步驟 2/2：實際測試下載速度…", "Step 2/2: testing download speed…")))
+    if not cands:
+        return {"svc": svc, "apply": False, "best": None, "ranked": [], "measured": False,
+                "reason": L("找不到可用的路線", "No usable route found")}
+    measured = True
+    try:
+        speeds = speed_test(svc, cands, step + L(f"測試 {sname(svc)} 的下載速度…", f"testing {sname(svc)} speed…"))
+    except Exception as e:      # 抓不到測速檔：只依延遲挑選
+        print(L(f"  （{sname(svc)}：{e}，改成只依延遲挑選）", f"  ({sname(svc)}: {e}; choosing by latency only)"))
+        speeds, measured = {}, False
+    ranked = rank(cands, speeds)
     for c in ranked:
-        c["is_base_gh"] = c["ip"] in base_gh
-        c["is_base_x_route"] = c["ip"] in {same_24(ip, GITHUB["suffix"]) for ip in base_x}
-
-    def smooth(n, total=SPEED_ROUNDS):
-        return L(f"{total} 次測試有 {n} 次順暢", f"smooth in {n} of {total} tests")
-
-    # GitHub
+        c["is_base"] = c["ip"] in base_ips
     best = ranked[0]
-    base_rows = [c for c in ranked if c["is_base_gh"]]
+    base_rows = [c for c in ranked if c["is_base"]]
     base_fast = max((c["fast"] for c in base_rows), default=0)
     base_pop = base_rows[0]["pop"] if base_rows else "?"
-    before = L(f"{base_word} {place(base_pop)}：", f"{base_word} {place(base_pop)}: ") + smooth(base_fast)
-    after = (L(f"建議路線 {place(best['pop'])}：", f"Suggested {place(best['pop'])}: ") + smooth(best["fast"]) +
-             L(f"，延遲約 {best['latency_ms']:.0f} ms", f", latency ~{best['latency_ms']:.0f} ms"))
-    if best["is_base_gh"]:
-        gh = {"apply": False, "reason": L(f"{base_word}已經是最順的路線，不需要改",
-                                          f"{base_word} is already the smoothest, no change needed")}
-    elif best["fast"] > base_fast:
-        gh = {"apply": True, "reason": f"{before}\n{after}"}
+    if measured:
+        before = L(f"{base_word} {place(base_pop)}：", f"{base_word} {place(base_pop)}: ") + smooth_text(base_fast)
+        after = (L(f"建議路線 {place(best['pop'])}：", f"Suggested {place(best['pop'])}: ") + smooth_text(best["fast"]) +
+                 L(f"，延遲約 {best['latency_ms']:.0f} ms", f", latency ~{best['latency_ms']:.0f} ms"))
+        if best["is_base"]:
+            res = {"apply": False, "reason": L(f"{base_word}已經是最順的路線，不需要改",
+                                               f"{base_word} is already the smoothest, no change needed")}
+        elif best["fast"] > base_fast:
+            res = {"apply": True, "reason": f"{before}\n{after}"}
+        else:
+            res = {"apply": False, "reason": before + L("，跟其他路線一樣順，不需要改",
+                                                        ", as smooth as the others, no change needed")}
+    elif not base_rows:
+        res = {"apply": True, "reason": L(
+            f"沒有測速；{base_word}連不上，依延遲建議 {place(best['pop'])}（約 {best['latency_ms']:.0f} ms）",
+            f"No speed test; {base_word} is unreachable, suggest {place(best['pop'])} by latency "
+            f"(~{best['latency_ms']:.0f} ms)")}
     else:
-        gh = {"apply": False, "reason": before + L("，跟其他路線一樣順，不需要改",
-                                                   ", as smooth as the others, no change needed")}
-    gh.update(group=GITHUB, best=best)
+        base_lat = min(c["latency_ms"] for c in base_rows)
+        if best["is_base"] or best["latency_ms"] >= base_lat - 10:
+            res = {"apply": False, "reason": L("沒有測速，延遲也沒有明顯較低的路線，不需要改",
+                                               "No speed test, and no route with clearly lower latency; no change")}
+        else:
+            res = {"apply": True, "reason": L(
+                f"沒有測速，依延遲建議 {place(best['pop'])}（約 {best['latency_ms']:.0f} ms，{base_word}約 {base_lat:.0f} ms）",
+                f"No speed test; by latency, suggest {place(best['pop'])} (~{best['latency_ms']:.0f} ms vs "
+                f"{base_word} ~{base_lat:.0f} ms)")}
+    res.update(svc=svc, best=best, ranked=ranked, measured=measured)
+    return res
 
-    # X 圖片：圖片太小測不出速度，用同一個 /24 在 GitHub 測速的結果代表該路線的穩定度。
-    # 但 X 不是每個節點都有部署（實測連香港的 IP，X 會轉給新加坡出貨），
-    # 所以只採用「X 實際出貨節點 = 該路線 GitHub 節點」的路線，確定真的走那條路。
-    by_ip = {c["ip"]: c for c in ranked}
-    base_x_fast, base_x_verified, base_x_pop = 0, False, "?"
-    for ip in base_x:
-        route = by_ip.get(same_24(ip, GITHUB["suffix"]))
+
+def evaluate_x(gh_ranked, base_word):
+    """X 圖片：圖片太小測不出速度，用同一個 /24 在 GitHub 測速的結果代表該路線的穩定度。
+    但 X 不是每個節點都有部署（實測連香港的 IP，X 會轉給新加坡出貨），
+    所以只採用「X 實際出貨節點 = 該路線 GitHub 節點」的路線，確定真的走那條路。"""
+    by_ip = {c["ip"]: c for c in gh_ranked}
+    base_fast, verified, base_pop = 0, False, "?"
+    for ip in resolve_system(X_IMAGES["probe"][0]):
+        route = by_ip.get(same_24(ip, GITHUB["probe"][2]))
         info = probe(X_IMAGES, ip)
         if info:
-            base_x_pop = info["pop"]
+            base_pop = info["pop"]
         if route and info and info["pop"] == route["pop"]:
-            base_x_fast = max(base_x_fast, route["fast"])
-            base_x_verified = True
-    x_best = None
-    for c in ranked:
-        if c["fast"] <= base_x_fast:
+            base_fast = max(base_fast, route["fast"])
+            verified = True
+    best = None
+    for c in gh_ranked:
+        if c["fast"] <= base_fast:
             break
-        info = probe(X_IMAGES, same_24(c["ip"], X_IMAGES["suffix"]))
+        info = probe(X_IMAGES, c["ip"])
         if info and info["pop"] == c["pop"]:
             info["fast"] = c["fast"]
-            x_best = info
+            best = info
             break
-    if x_best:
-        head = L(f"{base_word} {place(base_x_pop)}：", f"{base_word} {place(base_x_pop)}: ")
-        before = head + (smooth(base_x_fast) if base_x_verified else L("無法確認順不順", "cannot be verified"))
-        after = (L(f"建議路線 {place(x_best['pop'])}：", f"Suggested {place(x_best['pop'])}: ") + smooth(x_best["fast"]) +
-                 L(f"，延遲約 {x_best['latency_ms']:.0f} ms", f", latency ~{x_best['latency_ms']:.0f} ms"))
-        x = {"apply": True, "best": x_best, "reason": f"{before}\n{after}"}
-    else:
-        x = {"apply": False, "best": None,
-             "reason": L("沒有比目前更順、又能提供 X 圖片的路線，不需要改",
-                         "No smoother route that also serves X images, no change needed")}
-    x.update(group=X_IMAGES)
-    return {"github": gh, "x": x, "ranked": ranked, **sc}
+    if best:
+        head = L(f"{base_word} {place(base_pop)}：", f"{base_word} {place(base_pop)}: ")
+        before = head + (smooth_text(base_fast) if verified else L("無法確認順不順", "cannot be verified"))
+        after = (L(f"建議路線 {place(best['pop'])}：", f"Suggested {place(best['pop'])}: ") + smooth_text(best["fast"]) +
+                 L(f"，延遲約 {best['latency_ms']:.0f} ms", f", latency ~{best['latency_ms']:.0f} ms"))
+        return {"svc": X_IMAGES, "apply": True, "best": best, "ranked": [], "reason": f"{before}\n{after}"}
+    return {"svc": X_IMAGES, "apply": False, "best": None, "ranked": [],
+            "reason": L("沒有比目前更順、又能提供 X 圖片的路線，不需要改",
+                        "No smoother route that also serves X images, no change needed")}
+
+
+def analyze():
+    """掃描附近節點 + 測速 + 判斷。回傳每個啟用的服務各自的建議。"""
+    has_block = bool(current_block(read_hosts()))
+    base_word = L("目前設定", "Current setting") if has_block else L("目前路線", "Current route")
+    services = enabled_services()
+    keys = scan_keys(services)
+    sc = scan_cached(L("步驟 1/2：尋找附近的節點…", "Step 1/2: finding nearby nodes…"), keys)
+    out = {"results": [], **sc}
+    evaluated = {}
+    for svc in TESTED:
+        if svc["key"] in keys:
+            extra = ([same_24(ip, 133) for ip in resolve_system(X_IMAGES["probe"][0])]
+                     if svc is GITHUB and X_IMAGES in services else [])
+            evaluated[svc["key"]] = evaluate(svc, sc["found"][svc["key"]], base_word, extra,
+                                             L("步驟 2/2：", "Step 2/2: "))
+    for svc in services:
+        if svc is X_IMAGES:
+            out["results"].append(evaluate_x(evaluated["github"]["ranked"], base_word))
+        else:
+            out["results"].append(evaluated[svc["key"]])
+    return out
 
 
 # ---------------------------------------------------------------- 顯示
 
 def print_summary(result):
-    print(L(f"\n【結果】（掃描 {result['scanned']} 個位置，附近可用 {len(result['found'])} 個，"
-            f"略過較遠的 {result['skipped']} 個）",
-            f"\n[Result] (scanned {result['scanned']} locations, {len(result['found'])} usable nearby, "
-            f"{result['skipped']} distant ones skipped)"))
-    for key in ("github", "x"):
-        r = result[key]
+    usable = "、".join(f"{sname(BY_KEY[k])} {len(v)}" for k, v in result["found"].items())
+    usable_en = ", ".join(f"{sname(BY_KEY[k])} {len(v)}" for k, v in result["found"].items())
+    print(L(f"\n【結果】（掃描 {result['scanned']} 個位置，略過較遠的 {result['skipped']} 個；附近可用路線：{usable}）",
+            f"\n[Result] (scanned {result['scanned']} locations, skipped {result['skipped']} distant ones; "
+            f"usable nearby routes: {usable_en})"))
+    for r in result["results"]:
         if r["apply"]:
-            print(L(f"\n  ✔ {gname(r['group'])}：建議改走 {place(r['best']['pop'])}",
-                    f"\n  ✔ {gname(r['group'])}: switch to {place(r['best']['pop'])}"))
+            print(L(f"\n  ✔ {sname(r['svc'])}：建議改走 {place(r['best']['pop'])}",
+                    f"\n  ✔ {sname(r['svc'])}: switch to {place(r['best']['pop'])}"))
         else:
-            print(L(f"\n  ・{gname(r['group'])}：維持現狀", f"\n  - {gname(r['group'])}: keep as is"))
+            print(L(f"\n  ・{sname(r['svc'])}：維持現狀", f"\n  - {sname(r['svc'])}: keep as is"))
         for line in r["reason"].split("\n"):
             print(f"      {line}")
     print(L("\n  「順暢」＝速度達到這次測到最快速度的 30% 以上（且至少 3 Mbps）；卡住的路線通常只剩 1 Mbps 左右。",
@@ -589,34 +737,37 @@ def print_summary(result):
 
 
 def print_details(result):
-    print(L(f"\n【詳細數據】GitHub 下載測速（每條路線測 {SPEED_ROUNDS} 次，單位 Mbps）",
-            f"\n[Details] GitHub download speed ({SPEED_ROUNDS} tests per route, Mbps)"))
-    print(f"  {'IP':<16}{pad(L('地點', 'Location'), 20)}{L('延遲', 'Latency'):>7}  "
-          f"{pad(L('順暢', 'Smooth'), 7)}{L('各次速度', 'Speeds')}")
-    for c in result["ranked"]:
-        tag = (L("← 目前 GitHub", "← current GitHub") if c["is_base_gh"] else
-               (L("← 目前 X 圖片", "← current X images") if c["is_base_x_route"] else ""))
-        vs = " / ".join(f"{v:5.1f}" for v in c["speeds"])
-        smooth = f"{c['fast']}/{SPEED_ROUNDS}"
-        print(f"  {c['ip']:<16}{pad(place(c['pop']), 20)}{c['latency_ms']:5.0f}ms  {pad(smooth, 7)}{vs}  {tag}")
+    for r in result["results"]:
+        if not r["ranked"]:
+            continue
+        print(L(f"\n【詳細數據】{sname(r['svc'])}測速（每條路線測 {SPEED_ROUNDS} 次，單位 Mbps）",
+                f"\n[Details] {sname(r['svc'])} speed ({SPEED_ROUNDS} tests per route, Mbps)"))
+        lat = L("延遲", "Latency")
+        print(f"  {'IP':<16}{pad(L('地點', 'Location'), 20)}{' ' * (7 - width(lat))}{lat}  "
+              f"{pad(L('順暢', 'Smooth'), 7)}{L('各次速度', 'Speeds')}")
+        for c in r["ranked"]:
+            tag = L("← 目前", "← current") if c.get("is_base") else ""
+            vs = " / ".join(f"{v:5.1f}" for v in c["speeds"]) or L("（未測速）", "(not tested)")
+            smooth = f"{c['fast']}/{SPEED_ROUNDS}"
+            print(f"  {c['ip']:<16}{pad(place(c['pop']), 20)}{c['latency_ms']:5.0f}ms  {pad(smooth, 7)}{vs}  {tag}")
 
 
 def current_status():
-    """目前每組網域實際走的節點與延遲，以及 hosts 套用狀態。"""
+    """目前每個啟用的服務實際走的節點與延遲，以及 hosts 套用狀態。"""
     block = current_block(read_hosts())
     applied = next((l.split("applied", 1)[1].strip() for l in block if l.startswith("# applied")), None)
     rows = []
-    for g in GROUPS:
-        ips = resolve_system(g["probe_host"])
-        info = probe(g, ips[0], tries=3) if ips else None
-        rows.append({"group": g, "ip": ips[0] if ips else None, "info": info})
+    for svc in enabled_services():
+        ips = resolve_system(svc["probe"][0])
+        info = probe(svc, ips[0], tries=3) if ips else None
+        rows.append({"svc": svc, "ip": ips[0] if ips else None, "info": info})
     return {"block": block, "applied": applied, "rows": rows}
 
 
 def print_status(st):
     print(L("【目前狀況】", "[Current status]"))
     for r in st["rows"]:
-        label = pad(gname(r["group"]) + L("：", ":"), 20)
+        label = pad(sname(r["svc"]) + L("：", ":"), 22)
         if r["info"]:
             print(L(f"  {label}目前走 {place(r['info']['pop'])}，延遲約 {r['info']['latency_ms']:.0f} ms",
                     f"  {label}via {place(r['info']['pop'])}, latency ~{r['info']['latency_ms']:.0f} ms"))
@@ -624,7 +775,7 @@ def print_status(st):
             print(L(f"  {label}連不上（{r['ip']}）", f"  {label}unreachable ({r['ip']})"))
         else:
             print(L(f"  {label}查不到網址（DNS 失敗）", f"  {label}DNS lookup failed"))
-    label = pad(L("本工具設定：", "This tool:"), 20)
+    label = pad(L("本工具設定：", "This tool:"), 22)
     if st["block"]:
         print(L(f"  {label}已套用（{st['applied'] or '時間不明'}）",
                 f"  {label}applied ({st['applied'] or 'time unknown'})"))
@@ -699,11 +850,12 @@ def flush_dns():
 
 
 def write_routes(routes):
-    """routes：[(群組, IP, 節點代碼), ...]。整段取代本工具的設定，回傳備份檔路徑。"""
+    """routes：[(服務, 路線 IP, 節點代碼), ...]。整段取代本工具的設定，回傳備份檔路徑。
+    路線 IP 可以是該 /24 的任何尾碼，每個網域會換成自己的尾碼。"""
     lines = [MARK_BEGIN, f"# applied {datetime.now():%Y-%m-%d %H:%M}"]
-    for group, ip, pop in routes:
-        lines.append(f"# {group['key']}: Fastly {pop}")
-        lines += [f"{ip}\t{h}" for h in group["hosts"]]
+    for svc, ip, pop in routes:
+        lines.append(f"# {svc['key']}: Fastly {pop}")
+        lines += [f"{same_24(ip, sfx)}\t{host}" for host, sfx in svc["hosts"]]
     lines.append(MARK_END)
     backup = write_hosts(strip_block(read_hosts()) + "\n" + "\n".join(lines) + "\n")
     flush_dns()
@@ -713,8 +865,7 @@ def write_routes(routes):
 # ---------------------------------------------------------------- 權限
 
 def _script_args(action, pause, extra_args=()):
-    """重新執行自己時的程式與參數（exe 或 .py 都適用）。語言要明確傳下去：
-    Linux 的 sudo 會換成 root 的家目錄，讀不到使用者的語言設定。"""
+    """重新執行自己時的程式與參數（exe 或 .py 都適用）。語言明確傳下去，管理員視窗才會用同一種語言。"""
     extra = [action] + list(extra_args) + [f"--lang={LANG}"] + (["--pause"] if pause else [])
     if getattr(sys, "frozen", False):
         return sys.executable, extra
@@ -773,14 +924,22 @@ def cancelled(changed=False):
     return 0
 
 
+def estimate():
+    """預估（分鐘, MB）：掃描約半分鐘；每個服務測速約 1.5 分鐘；流量 GitHub 約 300 MB、Twitch 約 60 MB。"""
+    keys = scan_keys(enabled_services())
+    return round(0.5 + 1.5 * len(keys)), (300 if "github" in keys else 0) + (60 if "twitch" in keys else 0)
+
+
 def action_test(interactive=True):
-    print(L("\n開始測試，大約需要 2 分鐘，會用掉約 300 MB 流量（只測試，不改任何設定）。\n",
-            "\nTesting, about 2 minutes and ~300 MB of data (test only, nothing is changed).\n"))
+    mins, mb = estimate()
+    print(L(f"\n開始測試，大約需要 {mins} 分鐘，會用掉約 {mb} MB 流量（只測試，不改任何設定）。\n",
+            f"\nTesting, about {mins} minutes and ~{mb} MB of data (test only, nothing is changed).\n"))
     result = analyze()
     print_summary(result)
-    if interactive and result["ranked"] and ask_yes(L("\n要看詳細數據嗎？", "\nShow details?"), default=False):
+    has_details = any(r["ranked"] for r in result["results"])
+    if interactive and has_details and ask_yes(L("\n要看詳細數據嗎？", "\nShow details?"), default=False):
         print_details(result)
-    elif not interactive and result["ranked"]:
+    elif not interactive and has_details:
         print_details(result)
     return result
 
@@ -794,8 +953,7 @@ def action_apply(yes=False):
         write_hosts(strip_block(original))
         flush_dns()
     result = action_test(interactive=not yes)
-    routes = [(result[k]["group"], result[k]["best"]["ip"], result[k]["best"]["pop"])
-              for k in ("github", "x") if result[k]["apply"]]
+    routes = [(r["svc"], r["best"]["ip"], r["best"]["pop"]) for r in result["results"] if r["apply"]]
     if not routes:
         print(L("\n目前的路線已經很順，不需要修改，設定維持原狀。",
                 "\nThe current route is already smooth; nothing to change."))
@@ -803,8 +961,7 @@ def action_apply(yes=False):
     if not yes and not ask_yes(L("\n要套用上面建議的路線嗎？", "\nApply the suggested route(s)?")):
         return cancelled()
     backup = write_routes(routes)
-    print(L("\n✔ 已套用！之後 GitHub 下載 / X 圖片會走新的路線。",
-            "\n✔ Applied! GitHub downloads / X images will now use the new route."))
+    print(L("\n✔ 已套用！之後會走新的路線。", "\n✔ Applied! The new route(s) are now in use."))
     print(L(f"  （設定寫在 {HOSTS_PATH}，原始檔案備份在 {backup}）",
             f"  (Written to {HOSTS_PATH}; original backed up to {backup})"))
     print(L("  想恢復原狀，隨時選「還原」即可。", "  Choose \"Restore\" any time to undo."))
@@ -820,53 +977,72 @@ def find_region(text, regions):
     return min(same_city, key=lambda pop: regions[pop][0]["latency_ms"]) if same_city else None
 
 
-def choose_and_apply(pop, ips, verify=False):
-    """在指定地區的線路裡實測挑最穩的，確認後套用（GitHub + 可用的話 X 圖片）。
-    verify=True：IP 來自舊的掃描紀錄，先確認它們現在還連到同一個地區。"""
-    if verify:
-        checked = [probe(GITHUB, c["ip"], tries=3) for c in ips[:REGION_MAX_IPS + 2]]
-        cands = [c for c in checked if c and c["pop"] == pop][:REGION_MAX_IPS]
+def choose_and_apply(pop, found, verify=False):
+    """在指定地區，對每個啟用的服務實測挑最穩的線路，確認後套用。
+    found：{服務代碼: [路線]}；verify=True：路線來自舊的掃描紀錄，先確認它們現在還連到同一個地區。"""
+    services = enabled_services()
+    picks, lines = {}, []
+    for svc in TESTED:
+        if svc["key"] not in scan_keys(services):
+            continue
+        routes = [r for r in found.get(svc["key"], []) if r["pop"] == pop]
+        if verify:
+            checked = [probe(svc, r["ip"], tries=3) for r in routes[:REGION_MAX_IPS + 2]]
+            routes = [r for r in checked if r and r["pop"] == pop]
+        cands = routes[:REGION_MAX_IPS]
         if not cands:
-            print(L(f"上次記錄的 {place(pop)} 線路現在連不到，或已經改連別的地區。",
-                    f"The recorded routes to {place(pop)} are unreachable now or go elsewhere."))
-            print(L("請用「3. 手動選擇地區」重新掃描。", "Use \"3. Choose region\" to scan again."))
-            return 1
-    else:
-        cands = ips[:REGION_MAX_IPS]
-
-    # 同一個地區不同 IP 的穩定度差很多（實測東京有的 IP 每次都順、有的常卡），所以再挑一次
-    secs = max(10, len(cands) * 6)
-    print(L(f"\n測試 {place(pop)} 的 {len(cands)} 條線路（約 {secs} 秒）…",
-            f"\nTesting {len(cands)} route(s) to {place(pop)} (about {secs} s)…"))
-    ranked = rank(cands, speed_test(cands, L("測試線路…", "Testing routes…"), rounds=2))
-    for c in ranked:
-        vs = " / ".join(f"{v:5.1f}" for v in c["speeds"])
-        print(L(f"  {c['ip']:<16}延遲 {c['latency_ms']:4.0f} ms  順暢 {c['fast']}/2  [{vs}] Mbps",
-                f"  {c['ip']:<16}latency {c['latency_ms']:4.0f} ms  smooth {c['fast']}/2  [{vs}] Mbps"))
-    best = ranked[0]
-    if best["fast"] == 0 and not ask_yes(
-            L(f"\n{place(pop)} 目前每條線路都卡住，仍要改走這裡嗎？",
-              f"\nEvery route to {place(pop)} is congested right now. Switch anyway?"), default=False):
+            continue
+        secs = max(10, len(cands) * 6)
+        print(L(f"\n測試 {sname(svc)} 到 {place(pop)} 的 {len(cands)} 條線路（約 {secs} 秒）…",
+                f"\nTesting {len(cands)} {sname(svc)} route(s) to {place(pop)} (about {secs} s)…"))
+        try:
+            speeds = speed_test(svc, cands, L("測試線路…", "Testing routes…"), rounds=2)
+        except Exception as e:
+            print(L(f"  （{e}，改成只依延遲挑選）", f"  ({e}; choosing by latency only)"))
+            speeds = {}
+        ranked = rank(cands, speeds)
+        for c in ranked:
+            vs = " / ".join(f"{v:5.1f}" for v in c["speeds"]) or L("未測速", "not tested")
+            print(L(f"  {c['ip']:<16}延遲 {c['latency_ms']:4.0f} ms  順暢 {c['fast']}/2  [{vs}] Mbps",
+                    f"  {c['ip']:<16}latency {c['latency_ms']:4.0f} ms  smooth {c['fast']}/2  [{vs}] Mbps"))
+        picks[svc["key"]] = ranked
+    if not picks:
+        print(L(f"{place(pop)} 目前沒有可用的線路。", f"No usable route to {place(pop)} right now."))
+        return 1
+    stuck = [k for k, ranked in picks.items() if ranked[0]["speeds"] and ranked[0]["fast"] == 0]
+    if stuck and not ask_yes(
+            L(f"\n{place(pop)} 目前有服務的每條線路都卡住，仍要改走這裡嗎？",
+              f"\nEvery route to {place(pop)} is congested for some service right now. Switch anyway?"),
+            default=False):
         return cancelled()
 
-    # X 圖片：只採用 X 實際由這個地區出貨的線路
-    x = None
-    for c in ranked:
-        info = probe(X_IMAGES, same_24(c["ip"], X_IMAGES["suffix"]))
-        if info and info["pop"] == pop:
-            x = info
-            break
-    print(L(f"\n  {pad('GitHub 下載：', 14)}改走 {place(pop)}，使用 {best['ip']}",
-            f"\n  {pad('GitHub downloads:', 19)}switch to {place(pop)} via {best['ip']}"))
-    if x:
-        print(L(f"  {pad('X 圖片：', 14)}改走 {place(pop)}，使用 {x['ip']}",
-                f"  {pad('X images:', 19)}switch to {place(pop)} via {x['ip']}"))
-    else:
-        print(L(f"  {pad('X 圖片：', 14)}X 在 {place(pop)} 沒有機房，維持系統原本的路線",
-                f"  {pad('X images:', 19)}X has no node in {place(pop)}; keeping the default route"))
+    args = []
+    print()
+    for svc in services:
+        label = pad(sname(svc) + L("：", ":"), 22)
+        if svc is X_IMAGES:
+            # X 圖片：只採用 X 實際由這個地區出貨的線路
+            x = next((i for i in (probe(X_IMAGES, c["ip"]) for c in picks.get("github", []))
+                      if i and i["pop"] == pop), None)
+            if x:
+                args.append(f"x={x['ip']}:{pop}")
+                lines.append(L(f"  {label}改走 {place(pop)}，使用 {x['ip']}", f"  {label}switch to {place(pop)} via {x['ip']}"))
+            else:
+                lines.append(L(f"  {label}X 在 {place(pop)} 沒有機房，維持系統原本的路線",
+                               f"  {label}X has no node in {place(pop)}; keeping the default route"))
+        elif svc["key"] in picks:
+            best = picks[svc["key"]][0]
+            args.append(f"{svc['key']}={best['ip']}:{pop}")
+            lines.append(L(f"  {label}改走 {place(pop)}，使用 {best['ip']}", f"  {label}switch to {place(pop)} via {best['ip']}"))
+        else:
+            lines.append(L(f"  {label}在 {place(pop)} 沒有線路，維持系統原本的路線",
+                           f"  {label}no route in {place(pop)}; keeping the default route"))
+    print("\n".join(lines))
+    if not args:
+        print(L("沒有可以套用的線路。", "Nothing to apply."))
+        return 1
     if not ask_yes(L("\n確定要套用嗎？", "\nApply?")):
         return cancelled()
-    args = [f"github={best['ip']}:{pop}"] + ([f"x={x['ip']}:{pop}"] if x else [])
     return action_set(args)
 
 
@@ -878,97 +1054,100 @@ def ask_code(code):
 
 
 def full_scan_for(code):
-    """附近的掃描裡找不到時：問要不要完整掃描全世界的節點，回傳新的地區表或 None。"""
-    if not ask_yes(L(f"附近的節點裡沒有「{code}」，可能距離較遠被略過了。要完整掃描全世界的節點嗎？（約 1.5 分鐘）",
+    """附近的掃描裡找不到時：問要不要完整掃描全世界的節點，回傳新的 found 或 None。"""
+    if not ask_yes(L(f"附近的節點裡沒有「{code}」，可能距離較遠被略過了。要完整掃描全世界的節點嗎？（約 1.5～3 分鐘）",
                      f"\"{code}\" is not among nearby nodes (distant ones are skipped). "
-                     f"Scan all nodes worldwide? (about 1.5 min)")):
+                     f"Scan all nodes worldwide? (about 1.5-3 min)")):
         return None
-    return regions_from(scan_cached(L("掃描所有節點…", "Scanning all nodes…"), near_only=False)["found"])
+    return scan_cached(L("掃描所有節點…", "Scanning all nodes…"), scan_keys(enabled_services()), near_only=False)["found"]
 
 
 def action_region(code=None):
     """手動選擇地區：掃描附近、列出可用的地區，輸入代碼後在該地區挑最穩的線路。"""
     print(L("\n正在尋找附近可用的地區…", "\nFinding nearby regions…"))
-    regions = regions_from(scan_cached(L("尋找附近的地區…", "Finding nearby regions…"))["found"])
+    found = scan_cached(L("尋找附近的地區…", "Finding nearby regions…"), scan_keys(enabled_services()))["found"]
+    regions = regions_from(found)
     if not regions:
         print(L("找不到可用的地區（網路不通或被擋）。", "No usable region found (network down or blocked)."))
         return 1
-    nearest = sorted(regions, key=lambda pop: regions[pop][0]["latency_ms"])
     print(L("\n【附近可用的地區】（依延遲排序）", "\n[Nearby regions] (by latency)"))
-    for pop in nearest:
+    for pop in sorted(regions, key=lambda p: regions[p][0]["latency_ms"]):
         print(L(f"  {pop}  {pad(city(pop), 10)}延遲約 {regions[pop][0]['latency_ms']:.0f} ms",
                 f"  {pop}  {pad(city(pop), 14)}latency ~{regions[pop][0]['latency_ms']:.0f} ms"))
     print(L("  （較遠的地區已略過；也可以直接輸入它們的代碼，會再完整掃描）",
             "  (Distant regions are skipped; you can still enter their code to scan everything.)"))
-
     code = ask_code(code)
     if not code:
         return cancelled(changed=True)
     pop = find_region(code, regions)
     if not pop:
-        regions = full_scan_for(code)
-        pop = find_region(code, regions) if regions else None
+        found = full_scan_for(code)
+        pop = find_region(code, regions_from(found)) if found else None
     if not pop:
         print(L(f"找不到「{code}」這個地區，或你的網路目前連不到那裡。",
                 f"Region \"{code}\" not found, or it is unreachable from your network."))
         return 1
-    return choose_and_apply(pop, regions[pop])
+    return choose_and_apply(pop, found)
 
 
 def action_switch(code=None):
     """指定節點：用上次的掃描紀錄，直接輸入代碼切換（不用等掃描）。"""
+    keys = scan_keys(enabled_services())
     cache = load_scan()
-    if cache:
+    if cache and all(k in cache["found"] for k in keys):
         print(L(f"\n使用上次的掃描紀錄（{cache['time']}）。", f"\nUsing the last scan ({cache['time']})."))
-        regions = regions_from(cache["found"])
+        found, from_cache = cache["found"], True
     else:
-        print(L("\n還沒有掃描紀錄，先掃描附近的節點…", "\nNo scan yet; scanning nearby nodes first…"))
-        regions = regions_from(scan_cached(L("尋找附近的地區…", "Finding nearby regions…"))["found"])
+        print(L("\n沒有可用的掃描紀錄，先掃描附近的節點…", "\nNo usable scan record; scanning nearby nodes first…"))
+        found, from_cache = scan_cached(L("尋找附近的地區…", "Finding nearby regions…"), keys)["found"], False
     code = ask_code(code)
     if not code:
         return cancelled(changed=True)
-    pop = find_region(code, regions)
-    from_cache = bool(cache)
+    pop = find_region(code, regions_from(found))
     if not pop:
-        regions = full_scan_for(code)
-        pop, from_cache = (find_region(code, regions) if regions else None), False
+        found = full_scan_for(code)
+        pop, from_cache = (find_region(code, regions_from(found)) if found else None), False
     if not pop:
         print(L(f"找不到「{code}」這個節點，或你的網路目前連不到那裡。",
                 f"Node \"{code}\" not found, or it is unreachable from your network."))
         return 1
-    return choose_and_apply(pop, regions[pop], verify=from_cache)
+    return choose_and_apply(pop, found, verify=from_cache)
 
 
 def action_list():
     """查看所有節點的延遲，每頁 10 個。"""
+    keys = scan_keys(enabled_services())
     cache = load_scan()
-    if cache and not cache.get("near_only"):
+    full_cache = cache and not cache.get("near_only") and all(k in cache["found"] for k in keys)
+    if full_cache:
         rescan = ask_yes(L(f"\n上次掃描時間：{cache['time']}。要重新掃描所有節點嗎？（選 n 直接顯示上次的結果）",
                            f"\nLast scan: {cache['time']}. Scan all nodes again? (n = show the last result)"),
                          default=False)
     elif cache:
-        print(L(f"\n上次（{cache['time']}）只掃描了附近的節點，要看全部需要完整掃描（約 1.5 分鐘）。",
+        print(L(f"\n上次（{cache['time']}）只掃描了附近的節點，要看全部需要完整掃描（約 1.5～3 分鐘）。",
                 f"\nThe last scan ({cache['time']}) covered nearby nodes only; "
-                f"listing all needs a full scan (about 1.5 min)."))
-        if not ask_yes(L("要開始完整掃描嗎？（選 n 只顯示附近的節點）", "Start a full scan? (n = show nearby nodes only)")):
-            rescan = False
-        else:
-            rescan = True
+                f"listing all needs a full scan (about 1.5-3 min)."))
+        rescan = ask_yes(L("要開始完整掃描嗎？（選 n 只顯示附近的節點）", "Start a full scan? (n = show nearby nodes only)"))
     else:
-        print(L("\n還沒有掃描紀錄，需要先掃描所有節點（約 1.5 分鐘）。",
-                "\nNo scan yet; all nodes need to be scanned first (about 1.5 min)."))
+        print(L("\n還沒有掃描紀錄，需要先掃描所有節點（約 1.5～3 分鐘）。",
+                "\nNo scan yet; all nodes need to be scanned first (about 1.5-3 min)."))
         if not ask_yes(L("要開始掃描嗎？", "Start scanning?")):
             return cancelled(changed=True)
         rescan = True
     if rescan:
-        sc = scan_cached(L("掃描所有節點…", "Scanning all nodes…"), near_only=False)
-        regions, when = regions_from(sc["found"]), f"{datetime.now():%Y-%m-%d %H:%M}"
+        found = scan_cached(L("掃描所有節點…", "Scanning all nodes…"), keys, near_only=False)["found"]
+        when = f"{datetime.now():%Y-%m-%d %H:%M}"
     else:
-        regions, when = regions_from(cache["found"]), cache["time"]
+        found, when = cache["found"], cache["time"]
+    regions = regions_from(found)
     if not regions:
         print(L("找不到可用的節點（網路不通或被擋）。", "No usable node found (network down or blocked)."))
         return 1
 
+    def count(pop, key):
+        return sum(1 for r in found.get(key, []) if r["pop"] == pop)
+
+    cols = [k for k in keys if k in found]
     rows = sorted(regions.items(), key=lambda kv: kv[1][0]["latency_ms"])
     per, page = 10, 0
     pages = (len(rows) + per - 1) // per
@@ -976,9 +1155,10 @@ def action_list():
         print(L(f"\n【所有節點延遲】共 {len(rows)} 個｜第 {page + 1}/{pages} 頁｜掃描時間 {when}",
                 f"\n[Node latency] {len(rows)} nodes | page {page + 1}/{pages} | scanned {when}"))
         print(f"  {pad(L('排名', '#'), 6)}{pad(L('代碼', 'Code'), 6)}{pad(L('城市', 'City'), 18)}"
-              f"{L('延遲', 'Latency'):>7}   {L('線路數', 'Routes')}")
-        for i, (pop, ips) in enumerate(rows[page * per:(page + 1) * per], page * per + 1):
-            print(f"  {i:<6}{pop:<6}{pad(city(pop), 18)}{ips[0]['latency_ms']:5.0f} ms   {len(ips)}")
+              f"{L('延遲', 'Latency'):>7}   " + "  ".join(pad(BY_KEY[k]['name'][1].split()[0], 8) for k in cols))
+        for i, (pop, rs) in enumerate(rows[page * per:(page + 1) * per], page * per + 1):
+            print(f"  {i:<6}{pop:<6}{pad(city(pop), 18)}{rs[0]['latency_ms']:5.0f} ms   " +
+                  "  ".join(pad(str(count(pop, k) or "-"), 8) for k in cols))
         cmd = input(L("\nn 下一頁、p 上一頁、q 返回（直接按 Enter = 下一頁）：",
                       "\nn = next, p = previous, q = back (Enter = next): ")).strip().lower()
         if cmd in ("", "n"):
@@ -995,6 +1175,30 @@ def action_list():
             return 0
         else:
             print(L("請輸入 n、p 或 q。", "Please enter n, p or q."))
+
+
+def action_services():
+    """選擇要加速哪些服務。"""
+    while True:
+        states = load_config().get("services", {})
+        print(L("\n【要加速的服務】", "\n[Services to speed up]"))
+        for i, svc in enumerate(SERVICES, 1):
+            on = states.get(svc["key"], True)
+            print(f"  {i}. [{'x' if on else ' '}] {sname(svc)}")
+        print(L("  （Twitch 只能加速網頁、圖片和表情符號；直播影片本身不在 Fastly 上，改不到）",
+                "  (Twitch: pages, images and emotes only; the live video itself is not on Fastly)"))
+        choice = input(L("\n輸入編號切換開關，直接按 Enter 返回：", "\nEnter a number to toggle, or Enter to go back: ")).strip()
+        if not choice:
+            return 0
+        if not choice.isdigit() or not 1 <= int(choice) <= len(SERVICES):
+            print(L("請輸入列表中的編號。", "Please enter a number from the list."))
+            continue
+        key = SERVICES[int(choice) - 1]["key"]
+        states[key] = not states.get(key, True)
+        if not any(states.get(s["key"], True) for s in SERVICES):
+            print(L("至少要保留一個服務。", "At least one service must stay on."))
+            continue
+        save_config(services=states)
 
 
 def version_tuple(v):
@@ -1106,7 +1310,7 @@ def action_purge():
     if os.path.exists(cache_path()):
         items.append(L(f"掃描紀錄（{cache_path()}）", f"Scan record ({cache_path()})"))
     if os.path.exists(config_path()):
-        items.append(L(f"語言設定（{config_path()}）", f"Language setting ({config_path()})"))
+        items.append(L(f"語言與服務設定（{config_path()}）", f"Language and service settings ({config_path()})"))
     if not items:
         print(L("\n沒有任何本工具的資料，不需要刪除。", "\nThere is no data from this tool to delete."))
         return 0
@@ -1132,21 +1336,20 @@ def action_purge():
 
 
 def action_set(args):
-    """直接寫入指定的線路：set github=IP:代碼 [x=IP:代碼]（選地區提權後使用）。"""
-    groups = {"github": GITHUB, "x": X_IMAGES}
+    """直接寫入指定的線路：set 服務=IP:代碼 ...（選地區提權後使用）。服務：github、x、twitch。"""
     routes = []
     for arg in args:
         try:
             key, rest = arg.split("=", 1)
             ip, pop = rest.rsplit(":", 1)
             ipaddress.IPv4Address(ip)
-            if key not in groups or not (len(pop) == 3 and pop.isalpha()):
+            if key not in BY_KEY or not (len(pop) == 3 and pop.isalpha()):
                 raise ValueError
         except ValueError:
-            print(L(f"參數格式錯誤：{arg}（應為 github=IP:代碼 或 x=IP:代碼）",
-                    f"Invalid argument: {arg} (expected github=IP:CODE or x=IP:CODE)"))
+            print(L(f"參數格式錯誤：{arg}（應為 服務=IP:代碼，服務是 github、x 或 twitch）",
+                    f"Invalid argument: {arg} (expected SERVICE=IP:CODE; SERVICE is github, x or twitch)"))
             return 2
-        routes.append((groups[key], ip, pop.upper()))
+        routes.append((BY_KEY[key], ip, pop.upper()))
     if not routes:
         print(L("沒有指定要寫入的線路。", "No route specified."))
         return 2
@@ -1154,9 +1357,9 @@ def action_set(args):
         return 0 if run_elevated("set", args) else 1
     backup = write_routes(routes)
     print(L("\n✔ 已套用！", "\n✔ Applied!"))
-    for group, ip, pop in routes:
-        print(L(f"  {pad(gname(group) + '：', 14)}改走 {place(pop)}（{ip}）",
-                f"  {pad(gname(group) + ':', 19)}now via {place(pop)} ({ip})"))
+    for svc, ip, pop in routes:
+        label = pad(sname(svc) + L("：", ":"), 22)
+        print(L(f"  {label}改走 {place(pop)}（{ip}）", f"  {label}now via {place(pop)} ({ip})"))
     print(L(f"  （設定寫在 {HOSTS_PATH}，原始檔案備份在 {backup}）",
             f"  (Written to {HOSTS_PATH}; original backed up to {backup})"))
     return 0
@@ -1184,7 +1387,7 @@ def action_status():
 def action_language():
     global LANG
     LANG = "en" if LANG == "zh" else "zh"
-    save_lang_setting(LANG)
+    save_config(lang=LANG)
     print(L("✔ 已切換為中文。", "✔ Switched to English."))
     return 0
 
@@ -1192,14 +1395,17 @@ def action_language():
 def help_text():
     return L(f"""
 【這個工具在做什麼】
-  GitHub 的下載檔、X（Twitter）的圖片，都是透過一家叫 Fastly 的公司在世界各地的
-  機房傳給你。你的網路業者會自動幫你選一個機房，但選到的不一定順：
+  GitHub 的下載檔、X（Twitter）的圖片、Twitch 的網頁和圖片，都是透過一家叫 Fastly
+  的公司在世界各地的機房傳給你。你的網路業者會自動幫你選一個機房，但選到的不一定順：
   例如中華電信晚上連新加坡機房，常常卡到只剩 1 Mbps。
 
   這個工具會：
     1. 找出你附近能用的機房（比最近的機房慢 {NEAR_MARGIN_MS} ms 以上的會略過，約 15 秒）
-    2. 實際下載測試好幾次，看哪條路線最穩（約 1～2 分鐘）
+    2. 實際下載測試好幾次，看哪條路線最穩（每個服務約 1 分鐘）
     3. 把最穩的路線寫進電腦的 hosts 檔，讓電腦以後直接走那條路
+
+  要加速哪些服務，可以在「S. 服務設定」選擇。
+  Twitch 只能加速網頁、圖片和表情符號；直播影片和聊天室不在 Fastly 上，改不到。
 
   也可以自己指定要走哪裡：
     「3. 手動選擇地區」重新掃描後列出附近的地區再選
@@ -1215,16 +1421,21 @@ def help_text():
   掃描紀錄與設定：{data_dir()}
 """, f"""
 [What this tool does]
-  GitHub downloads and X (Twitter) images are delivered by a CDN called Fastly from
-  data centers around the world. Your ISP picks one for you automatically, but the
-  route is not always smooth: e.g. at night, Chunghwa Telecom users going through the
-  Singapore node often crawl at about 1 Mbps.
+  GitHub downloads, X (Twitter) images and Twitch pages/images are delivered by a CDN
+  called Fastly from data centers around the world. Your ISP picks one for you
+  automatically, but the route is not always smooth: e.g. at night, Chunghwa Telecom
+  users going through the Singapore node often crawl at about 1 Mbps.
 
   This tool:
     1. Finds usable nodes near you (anything {NEAR_MARGIN_MS} ms slower than the nearest
        one is skipped; about 15 s)
-    2. Downloads test data several times to see which route is the most stable (1-2 min)
+    2. Downloads test data several times to see which route is the most stable
+       (about 1 min per service)
     3. Writes the most stable route into your hosts file so your computer uses it
+
+  Choose which services to speed up under "S. Services".
+  Twitch: only pages, images and emotes can be sped up; the live video and chat are
+  not on Fastly.
 
   You can also choose where to go yourself:
     "3. Choose region"  scan, list nearby regions, then pick one
@@ -1244,9 +1455,10 @@ def help_text():
 
 
 def menu_text():
-    return L("""
+    mins = estimate()[0]
+    return L(f"""
 【請選擇】
-  1. 測試          找出目前最順的路線，只測試、不改設定（約 2 分鐘）
+  1. 測試          找出目前最順的路線，只測試、不改設定（約 {mins} 分鐘）
   2. 自動套用      測試後，把最順的路線設定到電腦上（需要管理員權限）
   3. 手動選擇地區  掃描後列出附近的地區，再選擇要走哪裡
   4. 還原          移除本工具的設定，回到原本的狀態
@@ -1255,11 +1467,12 @@ def menu_text():
   7. 更新          從 GitHub 檢查並下載新版本
   8. 所有節點延遲  列出所有節點的延遲，每頁 10 個
   9. 刪除          刪除本工具的所有資料，切回原本的節點
+  S. 服務設定      選擇要加速哪些服務（GitHub、X 圖片、Twitch）
   L. Language      切換為英文 / Switch to English
   h. 說明          這個工具在做什麼
-  0. 離開""", """
+  0. 離開""", f"""
 [Menu]
-  1. Test            Find the smoothest route; test only, nothing changes (~2 min)
+  1. Test            Find the smoothest route; test only, nothing changes (~{mins} min)
   2. Auto apply      Test, then set the smoothest route (needs administrator)
   3. Choose region   Scan, list nearby regions, then pick where to go
   4. Restore         Remove this tool's settings and go back to the original
@@ -1268,6 +1481,7 @@ def menu_text():
   7. Update          Check GitHub for a new version
   8. Node latency    List the latency of all nodes, 10 per page
   9. Delete          Delete all data from this tool and go back to the original
+  S. Services        Choose what to speed up (GitHub, X images, Twitch)
   L. Language        Switch to Chinese (中文)
   h. Help            What this tool does
   0. Exit""")
@@ -1277,8 +1491,8 @@ def menu():
     st = None
     while True:
         print("\n" + LINE)
-        print(L(f"  fastly-hosts {VERSION}｜加速 GitHub 下載與 X 圖片",
-                f"  fastly-hosts {VERSION} | Faster GitHub downloads and X images"))
+        print(L(f"  fastly-hosts {VERSION}｜加速 GitHub、X 圖片與 Twitch",
+                f"  fastly-hosts {VERSION} | Faster GitHub, X images and Twitch"))
         print(LINE)
         if st is None:
             print(L("正在檢查目前狀況…", "Checking current status…"))
@@ -1291,7 +1505,7 @@ def menu():
         else:
             print_status(st)
         print(menu_text())
-        choice = input(L("\n請輸入數字（h = 說明）：", "\nEnter a number (h = help): ")).strip().lower()
+        choice = input(L("\n請輸入數字或字母（h = 說明）：", "\nEnter a number or letter (h = help): ")).strip().lower()
         try:
             if choice == "1":
                 action_test()
@@ -1317,6 +1531,10 @@ def menu():
             elif choice == "9":
                 action_purge()
                 st = None
+            elif choice == "s":
+                action_services()
+                st = None
+                continue
             elif choice == "l":
                 action_language()
                 continue
@@ -1325,7 +1543,7 @@ def menu():
             elif choice == "0":
                 return 0
             else:
-                print(L("請輸入 0～9 的數字，或 L、h。", "Please enter 0-9, L or h."))
+                print(L("請輸入 0～9 的數字，或 S、L、h。", "Please enter 0-9, S, L or h."))
                 continue
         except PermissionError as e:
             print(L(f"\n寫入失敗，沒有權限：{e}", f"\nWrite failed, permission denied: {e}"))

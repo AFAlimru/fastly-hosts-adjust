@@ -31,9 +31,9 @@ cat > "$MENU_DIR/$APP_ID.desktop" << EOF
 [Desktop Entry]
 Type=Application
 Name=fastly-hosts
-Name[zh_TW]=fastly-hosts（GitHub 下載加速）
-Comment=Find the most stable Fastly route for GitHub downloads and X images
-Comment[zh_TW]=找出最順的 Fastly 路線，加速 GitHub 下載與 X 圖片
+Name[zh_TW]=fastly-hosts（GitHub、X、Twitch 加速）
+Comment=Find the most stable Fastly route for GitHub downloads, X images and Twitch
+Comment[zh_TW]=找出最順的 Fastly 路線，加速 GitHub 下載、X 圖片與 Twitch
 Exec=python3 "$SCRIPT"
 Icon=network-transmit-receive
 Terminal=true
