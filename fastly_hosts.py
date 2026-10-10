@@ -14,6 +14,8 @@ Commands / 指令：
   restore         remove this tool's hosts entries            還原
   purge           delete all data, back to the original route 刪除所有資料
   status          show the current status                     顯示目前狀況
+  add DOMAIN [URL]  add a Fastly domain (optional test file)  加入自訂網域（可附測速檔網址）
+  remove DOMAIN   remove a custom domain                      移除自訂網域
   --lang=en|zh    display language                            顯示語言
 
 Python standard library only; Windows and Linux. / 只使用 Python 標準函式庫，支援 Windows 與 Linux。
@@ -81,9 +83,8 @@ TWITCH = {
     "pop_probe": ("k.twitchcdn.net", "/", 167),   # static-cdn 的回應沒有 x-served-by
     "speed": "twitch",
 }
-SERVICES = [GITHUB, X_IMAGES, TWITCH]
-TESTED = [GITHUB, TWITCH]                         # 有自己的路線、會掃描和測速的服務
-BY_KEY = {s["key"]: s for s in SERVICES}
+BUILTIN = [GITHUB, X_IMAGES, TWITCH]
+CUSTOM_PREFIX = "custom:"
 
 # Fastly 節點代碼 → 城市（中文, 英文）
 POP_NAMES = {
@@ -153,8 +154,9 @@ LANG = "zh"
 
 
 def L(zh, en):
-    """依目前語言回傳中文或英文。英文版改用 ASCII（... 和 OK）：「…」「✔」在部分英文主控台會變成亂碼或問號。"""
-    return zh if LANG == "zh" else en.replace("…", "...").replace("✔", "OK")
+    """依目前語言回傳中文或英文。「✔」不在 Big5 和英文字碼頁裡，部分主控台會顯示成問號：
+    中文改用 Big5 有的「√」，英文改用 ASCII（... 和 OK；「…」在英文字碼頁也會變亂碼）。"""
+    return zh.replace("✔", "√") if LANG == "zh" else en.replace("…", "...").replace("✔", "OK")
 
 
 def detect_lang():
@@ -284,17 +286,40 @@ def load_lang_setting():
     return lang if lang in ("zh", "en") else None
 
 
+def custom_service(c):
+    """使用者自訂的網域。不知道網站有哪些路徑，所以檢查時對「/」發 HEAD，有回應（< 500）就算能用；
+    沒有提供測速檔就只依延遲挑選。"""
+    d = c["domain"]
+    return {"key": CUSTOM_PREFIX + d, "name": (d, d), "hosts": [(d, c["suffix"])], "probe": (d, "/", c["suffix"]),
+            "pop_probe": None, "any_status": True, "speed": "url" if c.get("test_url") else None,
+            "test_url": c.get("test_url"), "custom": True}
+
+
+def all_services():
+    return BUILTIN + [custom_service(c) for c in load_config().get("custom", [])]
+
+
+def svc_by_key(key):
+    return next((s for s in all_services() if s["key"] == key), None)
+
+
+def tested():
+    """有自己的路線、會掃描和測速的服務（X 圖片沿用 GitHub 的路線，不在內）。"""
+    return [s for s in all_services() if not s.get("via")]
+
+
 def enabled(svc):
     return load_config().get("services", {}).get(svc["key"], True)
 
 
 def enabled_services():
-    return [s for s in SERVICES if enabled(s)]
+    return [s for s in all_services() if enabled(s)]
 
 
 def scan_keys(services):
     """要掃描哪些服務的路線：X 圖片沿用 GitHub 的路線。"""
-    return [s["key"] for s in TESTED if s in services or any(x.get("via") == s["key"] for x in services)]
+    keys = {s["key"] for s in services if not s.get("via")} | {s["via"] for s in services if s.get("via")}
+    return [s["key"] for s in tested() if s["key"] in keys]
 
 
 # ---------------------------------------------------------------- 網路量測
@@ -383,7 +408,8 @@ def probe(svc, ip, tries=1, timeout=None):
     try:
         lat = tcp_latency(ip, tries=tries, timeout=timeout)
         r = https_get(host, path, ip, method="HEAD", timeout=timeout)
-        if lat is None or not r["ok"]:
+        usable = r["ok"] or (svc.get("any_status") and r.get("status", 999) < 500)
+        if lat is None or not usable:
             return None
         pop = pop_of(r.get("served_by"))
         if svc.get("pop_probe"):
@@ -471,7 +497,14 @@ def twitch_asset_url(candidates=()):
 
 
 def speed_url(svc, candidates=()):
-    return github_release_url() if svc["speed"] == "github" else twitch_asset_url(candidates)
+    kind = svc.get("speed")
+    if kind == "github":
+        return github_release_url()
+    if kind == "twitch":
+        return twitch_asset_url(candidates)
+    if kind == "url":
+        return svc["test_url"]
+    raise RuntimeError(L("沒有設定測速檔", "no speed-test file set"))
 
 
 def fastly_ranges():
@@ -522,8 +555,9 @@ def scan(label, keys, near_only=True):
         targets, tries, workers, start, share = blocks, 1, SCAN_WORKERS, 0, 80
     # 第二階段：各服務用自己的網域檢查
     jobs = [(k, b) for k in keys for b in targets]
+    svcs = {k: svc_by_key(k) for k in keys}
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(probe, BY_KEY[k], b, tries, SCAN_TIMEOUT): k for k, b in jobs}
+        futures = {pool.submit(probe, svcs[k], b, tries, SCAN_TIMEOUT): k for k, b in jobs}
         for done, fut in enumerate(as_completed(futures), 1):
             if fut.result():
                 found[futures[fut]].append(fut.result())
@@ -631,6 +665,8 @@ def evaluate(svc, found, base_word, extra_base=(), step=""):
         before = L(f"{base_word} {place(base_pop)}：", f"{base_word} {place(base_pop)}: ") + smooth_text(base_fast)
         after = (L(f"建議路線 {place(best['pop'])}：", f"Suggested {place(best['pop'])}: ") + smooth_text(best["fast"]) +
                  L(f"，延遲約 {best['latency_ms']:.0f} ms", f", latency ~{best['latency_ms']:.0f} ms"))
+        if best["pop"] == base_pop and not best["is_base"]:
+            after += L(f"（同地區的另一條線路 {best['ip']}）", f" (another route in the same region: {best['ip']})")
         if best["is_base"]:
             res = {"apply": False, "reason": L(f"{base_word}已經是最順的路線，不需要改",
                                                f"{base_word} is already the smoothest, no change needed")}
@@ -694,22 +730,28 @@ def evaluate_x(gh_ranked, base_word):
 
 def analyze():
     """掃描附近節點 + 測速 + 判斷。回傳每個啟用的服務各自的建議。"""
-    has_block = bool(current_block(read_hosts()))
-    base_word = L("目前設定", "Current setting") if has_block else L("目前路線", "Current route")
+    block = current_block(read_hosts())
+
+    def base_word(svc):
+        # 只有本工具真的設定過的服務才叫「目前設定」（舊版的 X 圖片標記是 x-images）
+        keys = {svc["key"], "x-images"} if svc is X_IMAGES else {svc["key"]}
+        mine = any(l.startswith(f"# {k}:") for l in block for k in keys)
+        return L("目前設定", "Current setting") if mine else L("目前路線", "Current route")
+
     services = enabled_services()
     keys = scan_keys(services)
     sc = scan_cached(L("步驟 1/2：尋找附近的節點…", "Step 1/2: finding nearby nodes…"), keys)
     out = {"results": [], **sc}
     evaluated = {}
-    for svc in TESTED:
+    for svc in tested():
         if svc["key"] in keys:
             extra = ([same_24(ip, 133) for ip in resolve_system(X_IMAGES["probe"][0])]
                      if svc is GITHUB and X_IMAGES in services else [])
-            evaluated[svc["key"]] = evaluate(svc, sc["found"][svc["key"]], base_word, extra,
+            evaluated[svc["key"]] = evaluate(svc, sc["found"][svc["key"]], base_word(svc), extra,
                                              L("步驟 2/2：", "Step 2/2: "))
     for svc in services:
         if svc is X_IMAGES:
-            out["results"].append(evaluate_x(evaluated["github"]["ranked"], base_word))
+            out["results"].append(evaluate_x(evaluated["github"]["ranked"], base_word(X_IMAGES)))
         else:
             out["results"].append(evaluated[svc["key"]])
     return out
@@ -718,8 +760,8 @@ def analyze():
 # ---------------------------------------------------------------- 顯示
 
 def print_summary(result):
-    usable = "、".join(f"{sname(BY_KEY[k])} {len(v)}" for k, v in result["found"].items())
-    usable_en = ", ".join(f"{sname(BY_KEY[k])} {len(v)}" for k, v in result["found"].items())
+    usable = "、".join(f"{sname(svc_by_key(k))} {len(v)}" for k, v in result["found"].items() if svc_by_key(k))
+    usable_en = ", ".join(f"{sname(svc_by_key(k))} {len(v)}" for k, v in result["found"].items() if svc_by_key(k))
     print(L(f"\n【結果】（掃描 {result['scanned']} 個位置，略過較遠的 {result['skipped']} 個；附近可用路線：{usable}）",
             f"\n[Result] (scanned {result['scanned']} locations, skipped {result['skipped']} distant ones; "
             f"usable nearby routes: {usable_en})"))
@@ -740,7 +782,7 @@ def print_details(result):
     for r in result["results"]:
         if not r["ranked"]:
             continue
-        print(L(f"\n【詳細數據】{sname(r['svc'])}測速（每條路線測 {SPEED_ROUNDS} 次，單位 Mbps）",
+        print(L(f"\n【詳細數據】{sname(r['svc'])} 測速（每條路線測 {SPEED_ROUNDS} 次，單位 Mbps）",
                 f"\n[Details] {sname(r['svc'])} speed ({SPEED_ROUNDS} tests per route, Mbps)"))
         lat = L("延遲", "Latency")
         print(f"  {'IP':<16}{pad(L('地點', 'Location'), 20)}{' ' * (7 - width(lat))}{lat}  "
@@ -748,7 +790,7 @@ def print_details(result):
         for c in r["ranked"]:
             tag = L("← 目前", "← current") if c.get("is_base") else ""
             vs = " / ".join(f"{v:5.1f}" for v in c["speeds"]) or L("（未測速）", "(not tested)")
-            smooth = f"{c['fast']}/{SPEED_ROUNDS}"
+            smooth = f"{c['fast']}/{SPEED_ROUNDS}" if c["speeds"] else "-"
             print(f"  {c['ip']:<16}{pad(place(c['pop']), 20)}{c['latency_ms']:5.0f}ms  {pad(smooth, 7)}{vs}  {tag}")
 
 
@@ -766,8 +808,9 @@ def current_status():
 
 def print_status(st):
     print(L("【目前狀況】", "[Current status]"))
+    cols = max([22] + [width(sname(r["svc"])) + 4 for r in st["rows"]])
     for r in st["rows"]:
-        label = pad(sname(r["svc"]) + L("：", ":"), 22)
+        label = pad(sname(r["svc"]) + L("：", ":"), cols)
         if r["info"]:
             print(L(f"  {label}目前走 {place(r['info']['pop'])}，延遲約 {r['info']['latency_ms']:.0f} ms",
                     f"  {label}via {place(r['info']['pop'])}, latency ~{r['info']['latency_ms']:.0f} ms"))
@@ -775,7 +818,7 @@ def print_status(st):
             print(L(f"  {label}連不上（{r['ip']}）", f"  {label}unreachable ({r['ip']})"))
         else:
             print(L(f"  {label}查不到網址（DNS 失敗）", f"  {label}DNS lookup failed"))
-    label = pad(L("本工具設定：", "This tool:"), 22)
+    label = pad(L("本工具設定：", "This tool:"), cols)
     if st["block"]:
         print(L(f"  {label}已套用（{st['applied'] or '時間不明'}）",
                 f"  {label}applied ({st['applied'] or 'time unknown'})"))
@@ -927,7 +970,10 @@ def cancelled(changed=False):
 def estimate():
     """預估（分鐘, MB）：掃描約半分鐘；每個服務測速約 1.5 分鐘；流量 GitHub 約 300 MB、Twitch 約 60 MB。"""
     keys = scan_keys(enabled_services())
-    return round(0.5 + 1.5 * len(keys)), (300 if "github" in keys else 0) + (60 if "twitch" in keys else 0)
+    timed = [k for k in keys if (svc_by_key(k) or {}).get("speed")]
+    mb = (300 if "github" in keys else 0) + (60 if "twitch" in keys else 0) + 30 * len(
+        [k for k in timed if k.startswith(CUSTOM_PREFIX)])
+    return max(1, round(0.5 + 1.5 * len(timed) + 0.2 * (len(keys) - len(timed)))), mb
 
 
 def action_test(interactive=True):
@@ -982,7 +1028,7 @@ def choose_and_apply(pop, found, verify=False):
     found：{服務代碼: [路線]}；verify=True：路線來自舊的掃描紀錄，先確認它們現在還連到同一個地區。"""
     services = enabled_services()
     picks, lines = {}, []
-    for svc in TESTED:
+    for svc in tested():
         if svc["key"] not in scan_keys(services):
             continue
         routes = [r for r in found.get(svc["key"], []) if r["pop"] == pop]
@@ -1147,7 +1193,12 @@ def action_list():
     def count(pop, key):
         return sum(1 for r in found.get(key, []) if r["pop"] == pop)
 
-    cols = [k for k in keys if k in found]
+    cols = [k for k in keys if k in found and svc_by_key(k)]
+
+    def col_label(k):
+        svc = svc_by_key(k)
+        label = svc["name"][1].split()[0] if not svc.get("custom") else svc["name"][1]
+        return label if len(label) <= 10 else label[:9] + "~"
     rows = sorted(regions.items(), key=lambda kv: kv[1][0]["latency_ms"])
     per, page = 10, 0
     pages = (len(rows) + per - 1) // per
@@ -1155,10 +1206,10 @@ def action_list():
         print(L(f"\n【所有節點延遲】共 {len(rows)} 個｜第 {page + 1}/{pages} 頁｜掃描時間 {when}",
                 f"\n[Node latency] {len(rows)} nodes | page {page + 1}/{pages} | scanned {when}"))
         print(f"  {pad(L('排名', '#'), 6)}{pad(L('代碼', 'Code'), 6)}{pad(L('城市', 'City'), 18)}"
-              f"{L('延遲', 'Latency'):>7}   " + "  ".join(pad(BY_KEY[k]['name'][1].split()[0], 8) for k in cols))
+              f"{L('延遲', 'Latency'):>7}   " + "  ".join(pad(col_label(k), 10) for k in cols))
         for i, (pop, rs) in enumerate(rows[page * per:(page + 1) * per], page * per + 1):
             print(f"  {i:<6}{pop:<6}{pad(city(pop), 18)}{rs[0]['latency_ms']:5.0f} ms   " +
-                  "  ".join(pad(str(count(pop, k) or "-"), 8) for k in cols))
+                  "  ".join(pad(str(count(pop, k) or "-"), 10) for k in cols))
         cmd = input(L("\nn 下一頁、p 上一頁、q 返回（直接按 Enter = 下一頁）：",
                       "\nn = next, p = previous, q = back (Enter = next): ")).strip().lower()
         if cmd in ("", "n"):
@@ -1177,12 +1228,133 @@ def action_list():
             print(L("請輸入 n、p 或 q。", "Please enter n, p or q."))
 
 
+HOSTNAME_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
+
+
+def fastly_ip(ip, ranges):
+    addr = ipaddress.ip_address(ip)
+    return any(addr in ipaddress.ip_network(r, strict=False) for r in ranges)
+
+
+def add_custom_domain(domain, test_url=None, ask=True):
+    """新增自訂網域：確認它在 Fastly 上、找出它用的 IP 尾碼，可選填測速檔。成功回傳 True。"""
+    domain = domain.strip().lower().rstrip(".")
+    if domain.startswith(("http://", "https://")):
+        domain = domain.split("/", 3)[2]
+    if not HOSTNAME_RE.match(domain):
+        print(L(f"「{domain}」不是有效的網域名稱。", f"\"{domain}\" is not a valid domain name."))
+        return False
+    existing = {h for s in all_services() for h, _ in s["hosts"]}
+    if domain in existing:
+        print(L(f"「{domain}」已經在清單裡了。", f"\"{domain}\" is already on the list."))
+        return False
+    ips = resolve_system(domain)
+    if not ips:
+        print(L(f"查不到「{domain}」的 IP（網域不存在或 DNS 失敗）。", f"Cannot resolve \"{domain}\"."))
+        return False
+    ranges = fastly_ranges()
+    fips = [ip for ip in ips if fastly_ip(ip, ranges)]
+    if not fips:
+        print(L(f"「{domain}」目前的 IP（{', '.join(ips[:3])}）不在 Fastly 上，這個工具只能加速 Fastly 的網域。",
+                f"\"{domain}\" ({', '.join(ips[:3])}) is not served by Fastly; this tool only works with Fastly."))
+        return False
+    suffixes = [int(ip.rsplit(".", 1)[1]) for ip in fips]
+    suffix = max(set(suffixes), key=suffixes.count)
+    svc = custom_service({"domain": domain, "suffix": suffix})
+    info = probe(svc, fips[0], tries=2)
+    if not info:
+        print(L(f"「{domain}」在 Fastly 上，但連線檢查失敗（憑證錯誤或沒有回應），無法加入。",
+                f"\"{domain}\" is on Fastly, but the connection check failed (certificate error or no reply)."))
+        return False
+    print(L(f"✔ 「{domain}」在 Fastly 上：IP 尾碼 .{suffix}，目前走 {place(info['pop'])}，延遲約 {info['latency_ms']:.0f} ms",
+            f"✔ \"{domain}\" is on Fastly: last octet .{suffix}, via {place(info['pop'])}, "
+            f"latency ~{info['latency_ms']:.0f} ms"))
+
+    if test_url is None and ask:
+        print(L("\n測速用的檔案網址（選填）：同一個網域上、至少幾百 KB 的檔案，例如影片或大圖片。",
+                "\nSpeed-test file URL (optional): a file of at least a few hundred KB on the same domain."))
+        print(L("  不填的話，只能依延遲挑選路線，無法分辨哪條路線會卡住。",
+                "  Without one, routes are chosen by latency only; congestion cannot be detected."))
+        test_url = input(L("網址（直接按 Enter 略過）：", "URL (Enter to skip): ")).strip() or None
+    if test_url:
+        if not test_url.lower().startswith(f"https://{domain}/"):
+            print(L(f"測速網址要以 https://{domain}/ 開頭，已略過測速檔。",
+                    f"The URL must start with https://{domain}/; skipping the speed-test file."))
+            test_url = None
+        else:
+            path = "/" + test_url.split("/", 3)[3]
+            try:
+                r = https_get(domain, path, info["ip"], max_bytes=SPEED_SAMPLE_BYTES, max_seconds=5)
+                if not r["ok"]:
+                    raise RuntimeError(f"HTTP {r['status']}")
+                if r["bytes"] < 256 * 1024:
+                    print(L(f"（這個檔案只有 {r['bytes'] / 1024:.0f} KB，太小可能測不出差異）",
+                            f"(This file is only {r['bytes'] / 1024:.0f} KB; it may be too small to tell routes apart)"))
+            except Exception as e:
+                print(L(f"測速檔下載失敗（{e}），已略過測速檔。", f"Speed-test file failed ({e}); skipping it."))
+                test_url = None
+    customs = load_config().get("custom", [])
+    customs.append({"domain": domain, "suffix": suffix, "test_url": test_url})
+    save_config(custom=customs)
+    print(L(f"✔ 已加入「{domain}」" + ("，有測速檔。" if test_url else "，沒有測速檔（只依延遲挑選）。"),
+            f"✔ Added \"{domain}\"" + (" with a speed-test file." if test_url else " without a speed-test file "
+                                                                                     "(latency only).")))
+    print(L("  之後的測試、套用、選擇地區都會包含它，也可以在「S. 服務設定」開關。",
+            "  It is now included in test, apply and region selection; toggle it under \"S. Services\"."))
+    return True
+
+
+def remove_custom_domain(domain):
+    customs = load_config().get("custom", [])
+    left = [c for c in customs if c["domain"] != domain]
+    if len(left) == len(customs):
+        print(L(f"清單裡沒有「{domain}」。", f"\"{domain}\" is not on the list."))
+        return False
+    services = load_config().get("services", {})
+    services.pop(CUSTOM_PREFIX + domain, None)
+    save_config(custom=left, services=services)
+    print(L(f"✔ 已移除「{domain}」。如果已經套用過，hosts 裡它的設定會在下次「套用」或「還原」時移除。",
+            f"✔ Removed \"{domain}\". If it was applied, its hosts entry goes away at the next apply or restore."))
+    return True
+
+
+def action_custom():
+    """自訂網域：列出、新增、移除。"""
+    while True:
+        customs = load_config().get("custom", [])
+        print(L("\n【自訂網域】", "\n[Custom domains]"))
+        if not customs:
+            print(L("  （還沒有自訂網域）", "  (none yet)"))
+        for i, c in enumerate(customs, 1):
+            tag = L("有測速檔", "speed test") if c.get("test_url") else L("只看延遲", "latency only")
+            print(f"  {i}. {c['domain']}  (.{c['suffix']}, {tag})")
+        print(L("\n  a. 新增　r. 移除　直接按 Enter 返回", "\n  a. Add   r. Remove   Enter to go back"))
+        choice = input(L("請選擇：", "Choose: ")).strip().lower()
+        if not choice:
+            return 0
+        if choice == "a":
+            domain = input(L("要加入的網域（例如 video.twimg.com）：", "Domain to add (e.g. video.twimg.com): ")).strip()
+            if domain:
+                add_custom_domain(domain)
+        elif choice == "r":
+            if not customs:
+                continue
+            n = input(L("要移除第幾個：", "Number to remove: ")).strip()
+            if n.isdigit() and 1 <= int(n) <= len(customs):
+                remove_custom_domain(customs[int(n) - 1]["domain"])
+            else:
+                print(L("請輸入列表中的編號。", "Please enter a number from the list."))
+        else:
+            print(L("請輸入 a、r，或直接按 Enter。", "Please enter a, r, or just Enter."))
+
+
 def action_services():
     """選擇要加速哪些服務。"""
     while True:
         states = load_config().get("services", {})
         print(L("\n【要加速的服務】", "\n[Services to speed up]"))
-        for i, svc in enumerate(SERVICES, 1):
+        services = all_services()
+        for i, svc in enumerate(services, 1):
             on = states.get(svc["key"], True)
             print(f"  {i}. [{'x' if on else ' '}] {sname(svc)}")
         print(L("  （Twitch 只能加速網頁、圖片和表情符號；直播影片本身不在 Fastly 上，改不到）",
@@ -1190,12 +1362,12 @@ def action_services():
         choice = input(L("\n輸入編號切換開關，直接按 Enter 返回：", "\nEnter a number to toggle, or Enter to go back: ")).strip()
         if not choice:
             return 0
-        if not choice.isdigit() or not 1 <= int(choice) <= len(SERVICES):
+        if not choice.isdigit() or not 1 <= int(choice) <= len(services):
             print(L("請輸入列表中的編號。", "Please enter a number from the list."))
             continue
-        key = SERVICES[int(choice) - 1]["key"]
+        key = services[int(choice) - 1]["key"]
         states[key] = not states.get(key, True)
-        if not any(states.get(s["key"], True) for s in SERVICES):
+        if not any(states.get(s["key"], True) for s in services):
             print(L("至少要保留一個服務。", "At least one service must stay on."))
             continue
         save_config(services=states)
@@ -1343,13 +1515,14 @@ def action_set(args):
             key, rest = arg.split("=", 1)
             ip, pop = rest.rsplit(":", 1)
             ipaddress.IPv4Address(ip)
-            if key not in BY_KEY or not (len(pop) == 3 and pop.isalpha()):
+            if not svc_by_key(key) or not (len(pop) == 3 and pop.isalpha()):
                 raise ValueError
         except ValueError:
-            print(L(f"參數格式錯誤：{arg}（應為 服務=IP:代碼，服務是 github、x 或 twitch）",
-                    f"Invalid argument: {arg} (expected SERVICE=IP:CODE; SERVICE is github, x or twitch)"))
+            keys = "、".join(s["key"] for s in all_services())
+            print(L(f"參數格式錯誤：{arg}（應為 服務=IP:代碼，服務是 {keys}）",
+                    f"Invalid argument: {arg} (expected SERVICE=IP:CODE; SERVICE is one of {keys.replace('、', ', ')})"))
             return 2
-        routes.append((BY_KEY[key], ip, pop.upper()))
+        routes.append((svc_by_key(key), ip, pop.upper()))
     if not routes:
         print(L("沒有指定要寫入的線路。", "No route specified."))
         return 2
@@ -1404,7 +1577,7 @@ def help_text():
     2. 實際下載測試好幾次，看哪條路線最穩（每個服務約 1 分鐘）
     3. 把最穩的路線寫進電腦的 hosts 檔，讓電腦以後直接走那條路
 
-  要加速哪些服務，可以在「S. 服務設定」選擇。
+  要加速哪些服務，可以在「S. 服務設定」選擇；其他放在 Fastly 上的網域，可以在「D. 自訂網域」自己加入。
   Twitch 只能加速網頁、圖片和表情符號；直播影片和聊天室不在 Fastly 上，改不到。
 
   也可以自己指定要走哪裡：
@@ -1433,7 +1606,8 @@ def help_text():
        (about 1 min per service)
     3. Writes the most stable route into your hosts file so your computer uses it
 
-  Choose which services to speed up under "S. Services".
+  Choose which services to speed up under "S. Services"; add other Fastly-served
+  domains under "D. Custom domains".
   Twitch: only pages, images and emotes can be sped up; the live video and chat are
   not on Fastly.
 
@@ -1467,7 +1641,8 @@ def menu_text():
   7. 更新          從 GitHub 檢查並下載新版本
   8. 所有節點延遲  列出所有節點的延遲，每頁 10 個
   9. 刪除          刪除本工具的所有資料，切回原本的節點
-  S. 服務設定      選擇要加速哪些服務（GitHub、X 圖片、Twitch）
+  S. 服務設定      選擇要加速哪些服務（GitHub、X 圖片、Twitch、自訂網域）
+  D. 自訂網域      自己加入其他放在 Fastly 上的網域
   L. Language      切換為英文 / Switch to English
   h. 說明          這個工具在做什麼
   0. 離開""", f"""
@@ -1481,7 +1656,8 @@ def menu_text():
   7. Update          Check GitHub for a new version
   8. Node latency    List the latency of all nodes, 10 per page
   9. Delete          Delete all data from this tool and go back to the original
-  S. Services        Choose what to speed up (GitHub, X images, Twitch)
+  S. Services        Choose what to speed up (GitHub, X images, Twitch, custom)
+  D. Custom domains  Add other domains that are served by Fastly
   L. Language        Switch to Chinese (中文)
   h. Help            What this tool does
   0. Exit""")
@@ -1535,6 +1711,10 @@ def menu():
                 action_services()
                 st = None
                 continue
+            elif choice == "d":
+                action_custom()
+                st = None
+                continue
             elif choice == "l":
                 action_language()
                 continue
@@ -1543,7 +1723,7 @@ def menu():
             elif choice == "0":
                 return 0
             else:
-                print(L("請輸入 0～9 的數字，或 S、L、h。", "Please enter 0-9, S, L or h."))
+                print(L("請輸入 0～9 的數字，或 S、D、L、h。", "Please enter 0-9, S, D, L or h."))
                 continue
         except PermissionError as e:
             print(L(f"\n寫入失敗，沒有權限：{e}", f"\nWrite failed, permission denied: {e}"))
@@ -1566,6 +1746,9 @@ def main(argv):
             "list": action_list, "update": action_update, "purge": action_purge,
             "purge-system": lambda: purge_system() if is_admin() else
             (print(L("需要管理員 / root 權限。", "Administrator / root permission needed.")), 1)[1],
+            "add": lambda: (0 if len(args) > 1 and add_custom_domain(args[1], args[2] if len(args) > 2 else None,
+                                                                      ask=False) else 1),
+            "remove": lambda: (0 if len(args) > 1 and remove_custom_domain(args[1].lower()) else 1),
             "set": lambda: action_set(args[1:]), "restore": action_restore, "status": action_status}
     if args and args[0] not in cmds:
         print(__doc__)

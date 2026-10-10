@@ -48,7 +48,8 @@ Good routes change as ISPs adjust their routing, so every run tests again; no IP
   7. Update          Check GitHub for a new version
   8. Node latency    List the latency of all nodes, 10 per page
   9. Delete          Delete all data from this tool and go back to the original
-  S. Services        Choose what to speed up (GitHub, X images, Twitch)
+  S. Services        Choose what to speed up (GitHub, X images, Twitch, custom)
+  D. Custom domains  Add other domains that are served by Fastly
   L. Language        Switch to Chinese (中文)
   h. Help            What this tool does
   0. Exit
@@ -81,6 +82,15 @@ Press `S` in the menu to choose; all are on by default. If you don't use Twitch,
 | Twitch pages & images | `www.twitch.tv`, `gql.twitch.tv`, `static-cdn.jtvnw.net`, `assets.twitch.tv`, `k.twitchcdn.net` |
 
 **Twitch limitation**: only pages, images, emotes and site data are on Fastly, so this helps with pages that keep spinning, slow images and slow channel switching. **The live video and chat** run on Twitch's own servers and AWS, which this tool cannot change.
+
+### Custom domains
+
+You can add other sites served by Fastly: press `D` → `a` in the menu and enter a domain, e.g. X videos `video.twimg.com` or the Python package index `files.pythonhosted.org`.
+
+- The tool first checks that the domain is served by Fastly and refuses otherwise (it only works with Fastly)
+- It detects the domain's last octet automatically (e.g. `.158` for `video.twimg.com`) and finds nearby routes that serve it
+- **Speed-test file (optional)**: a URL on the same domain of at least a few hundred KB. With it, congested routes can be detected; without it, routes are chosen by latency only and marked "no speed test"
+- Once added, it works like the built-in services: test, apply, region selection, status, the `S` toggle, and "9. Delete" removes it
 
 ### Language
 
@@ -126,6 +136,8 @@ fastly_hosts.py update         check for updates
 fastly_hosts.py restore        restore
 fastly_hosts.py purge          delete all data
 fastly_hosts.py status         current status
+fastly_hosts.py add DOMAIN [TEST_URL]  add a custom domain
+fastly_hosts.py remove DOMAIN  remove a custom domain
 --lang=en / --lang=zh          display language
 ```
 
@@ -134,7 +146,7 @@ On Windows, use `fastly-hosts.exe` with the same arguments.
 ## FAQ
 
 **What does it change on my computer?**
-Only a small, marked block in the hosts file (Windows: `C:\Windows\System32\drivers\etc\hosts`, Linux: `/etc/hosts`), affecting only the domains of the services you have turned on (see the table above).
+Only a small, marked block in the hosts file (Windows: `C:\Windows\System32\drivers\etc\hosts`, Linux: `/etc/hosts`), affecting only the domains of the services you have turned on (see the table above) and the custom domains you added.
 
 "Restore" removes that block completely and leaves everything else untouched. Before the first change, the original file is backed up as `hosts.fastly-hosts.bak`.
 

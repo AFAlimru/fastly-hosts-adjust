@@ -48,7 +48,8 @@ GitHub 的 release 下載檔、raw 檔案、X 的圖片，還有 Twitch 的網�
   7. 更新          從 GitHub 檢查並下載新版本
   8. 所有節點延遲  列出所有節點的延遲，每頁 10 個
   9. 刪除          刪除本工具的所有資料，切回原本的節點
-  S. 服務設定      選擇要加速哪些服務（GitHub、X 圖片、Twitch）
+  S. 服務設定      選擇要加速哪些服務（GitHub、X 圖片、Twitch、自訂網域）
+  D. 自訂網域      自己加入其他放在 Fastly 上的網域
   L. Language      切換為英文 / Switch to English
   h. 說明          這個工具在做什麼
   0. 離開
@@ -81,6 +82,15 @@ sh linux/install.sh
 | Twitch 網頁與圖片 | `www.twitch.tv`、`gql.twitch.tv`、`static-cdn.jtvnw.net`、`assets.twitch.tv`、`k.twitchcdn.net` |
 
 **Twitch 的限制**：只有網頁、圖片、表情符號和網站資料在 Fastly 上，能改善的是「網頁一直轉圈」、「圖片跑很久」、「切頻道很慢」這類問題。**直播影片本身和聊天室**在 Twitch 自己的機房與 AWS 上，這個工具改不到。
+
+### 自訂網域
+
+其他放在 Fastly 上的網站也可以自己加入，選單按 `D` → `a`，輸入網域即可，例如 X 的影片 `video.twimg.com`、Python 套件庫 `files.pythonhosted.org`。
+
+- 程式會先檢查這個網域是不是在 Fastly 上，不是的話會拒絕並說明原因（這個工具只能處理 Fastly）
+- 會自動判斷它用的 IP 尾碼（例如 `video.twimg.com` 是 `.158`），並在附近的節點裡找出能提供它的路線
+- **測速檔（選填）**：可以填一個同網域、至少幾百 KB 的檔案網址。有測速檔才能分辨哪條路線會卡住；沒有的話只能依延遲挑選，結果會標示「沒有測速」
+- 加入後跟內建服務一樣，會出現在測試、套用、選擇地區、狀態裡，也能在 `S` 開關；「9. 刪除」會一併清除
 
 ### 語言
 
@@ -126,6 +136,8 @@ fastly_hosts.py update         檢查更新
 fastly_hosts.py restore        還原
 fastly_hosts.py purge          刪除所有資料
 fastly_hosts.py status         顯示目前狀況
+fastly_hosts.py add 網域 [測速檔網址]  加入自訂網域
+fastly_hosts.py remove 網域    移除自訂網域
 --lang=zh / --lang=en          指定語言
 ```
 
@@ -134,7 +146,7 @@ Windows 用 `fastly-hosts.exe` 加上同樣的參數。
 ## 常見問題
 
 **會改到我電腦的什麼？**
-只會在 hosts 檔（Windows：`C:\Windows\System32\drivers\etc\hosts`，Linux：`/etc/hosts`）加上一小段有標記的設定，影響的只有上面「要加速哪些服務」表格列出、而且有開啟的網域。
+只會在 hosts 檔（Windows：`C:\Windows\System32\drivers\etc\hosts`，Linux：`/etc/hosts`）加上一小段有標記的設定，影響的只有上面「要加速哪些服務」表格列出、而且有開啟的網域，以及你自己加入的自訂網域。
 
 「還原」會把這段完整移除，原本的內容不會動。第一次修改前，會自動把原檔備份成 `hosts.fastly-hosts.bak`。
 
