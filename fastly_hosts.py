@@ -47,7 +47,7 @@ HOSTS_PATH = (os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System3
 MARK_BEGIN = "# >>> fastly-hosts >>> (managed by fastly_hosts.py, do not edit this block)"
 MARK_END = "# <<< fastly-hosts <<<"
 USER_AGENT = f"fastly-hosts/{VERSION}"
-REPO = "AFAlimru/fastly-hosts"          # 檢查更新用
+REPO = "AFAlimru/fastly-hosts-adjust"          # 檢查更新用
 
 # GitHub 用 Fastly IP 尾碼 .133、X 圖片用 .159（同一個 /24 走同一條路線）
 GITHUB = {

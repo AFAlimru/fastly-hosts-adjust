@@ -60,8 +60,8 @@ Options that change settings (apply, choose region, switch node, restore, delete
 Requires Python 3.8 or later (preinstalled on Ubuntu and most distributions).
 
 ```sh
-git clone https://github.com/AFAlimru/fastly-hosts.git
-cd fastly-hosts
+git clone https://github.com/AFAlimru/fastly-hosts-adjust.git
+cd fastly-hosts-adjust
 sh linux/install.sh
 ```
 

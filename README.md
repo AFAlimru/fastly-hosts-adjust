@@ -60,8 +60,8 @@ GitHub 的 release 下載檔、raw 檔案，還有 X 的圖片，都是透過 CD
 需要 Python 3.8 以上（Ubuntu 等發行版通常已內建）。
 
 ```sh
-git clone https://github.com/AFAlimru/fastly-hosts.git
-cd fastly-hosts
+git clone https://github.com/AFAlimru/fastly-hosts-adjust.git
+cd fastly-hosts-adjust
 sh linux/install.sh
 ```
 
