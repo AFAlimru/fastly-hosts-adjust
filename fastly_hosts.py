@@ -6,18 +6,25 @@
 也可以加參數執行：
   test      找出最順的路線，只測試、不改任何設定
   apply     測試後把最順的路線寫入 hosts（需要管理員 / root）
-  region [代碼]  手動選擇地區，例如：region ICN、region 首爾
+  region [代碼]  掃描後手動選擇地區，例如：region ICN、region 首爾
+  switch [代碼]  用上次的掃描紀錄直接切換，例如：switch ICN
+  list      查看所有節點的延遲
+  update    從 GitHub 檢查並下載新版本
   restore   移除本工具寫入的設定
+  purge     刪除本工具的所有資料，切回原本的節點
   status    顯示目前狀況
   --yes     套用時不再詢問確認
 
 只使用 Python 標準函式庫，支援 Windows 與 Linux。
 """
+import hashlib
 import http.client
+import io
 import ipaddress
 import json
 import os
 import platform
+import re
 import shutil
 import socket
 import ssl
@@ -25,10 +32,13 @@ import statistics
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 IS_WINDOWS = platform.system() == "Windows"
 HOSTS_PATH = (os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "drivers", "etc", "hosts")
               if IS_WINDOWS else "/etc/hosts")
@@ -36,6 +46,7 @@ HOSTS_PATH = (os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System3
 MARK_BEGIN = "# >>> fastly-hosts >>> (managed by fastly_hosts.py, do not edit this block)"
 MARK_END = "# <<< fastly-hosts <<<"
 USER_AGENT = f"fastly-hosts/{VERSION}"
+REPO = "AFAlimru/fastly-hosts"          # 檢查更新用
 
 # GitHub 用 Fastly IP 尾碼 .133、X 圖片用 .159（同一個 /24 走同一條路線）
 GITHUB = {
@@ -87,6 +98,7 @@ FALLBACK_RANGES = [
 SCAN_WORKERS = 48           # 掃描時同時連線數
 SCAN_TIMEOUT = 3
 SPEED_TOP_N = 10            # 掃描後挑延遲最低的幾個 IP 來測速
+REGION_MAX_IPS = 8          # 指定地區時最多測幾條線路（同地區不同線路的穩定度差很多，測少了容易漏掉好的）
 # 實測（HiNet 晚上）：塞住的路線是「連線一開始就卡在 1 Mbps 以下」，
 # 同一個 IP 有時快有時卡，所以多輪交錯測、看順暢的比例，不看單次速度。
 SPEED_ROUNDS = 3
@@ -302,11 +314,57 @@ def rank(candidates, speeds):
     return sorted(candidates, key=lambda c: (-c["fast"], -c["median"], c["latency_ms"]))
 
 
+def cache_path():
+    if IS_WINDOWS:
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    else:
+        base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    return os.path.join(base, "fastly-hosts", "scan-cache.json")
+
+
+def save_scan(found, scanned):
+    # Linux 用 sudo 執行時不寫：避免在 /root 或使用者資料夾留下 root 擁有的檔案
+    if not IS_WINDOWS and os.geteuid() == 0:
+        return
+    try:
+        os.makedirs(os.path.dirname(cache_path()), exist_ok=True)
+        with open(cache_path(), "w", encoding="utf-8") as f:
+            json.dump({"time": f"{datetime.now():%Y-%m-%d %H:%M}", "scanned": scanned, "found": found}, f)
+    except OSError:
+        pass
+
+
+def load_scan():
+    try:
+        with open(cache_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if data.get("found") else None
+    except (OSError, ValueError):
+        return None
+
+
+def scan_cached(label="步驟 1/2：尋找附近的節點…"):
+    found, scanned, usable = scan(fastly_ranges(), label=label)
+    save_scan(found, scanned)
+    return found, scanned, usable
+
+
+def regions_from(found):
+    """掃描結果依地區分組：{節點代碼: [IP 資訊（依延遲排序）]}。"""
+    regions = {}
+    for r in found:
+        if r.get("pop") and r["pop"] != "?":
+            regions.setdefault(r["pop"], []).append(r)
+    for ips in regions.values():
+        ips.sort(key=lambda r: r["latency_ms"])
+    return regions
+
+
 def analyze():
     """掃描 + 測速 + 判斷。回傳 GitHub 與 X 圖片各自的建議。"""
     has_block = bool(current_block(read_hosts()))
     base_word = "目前設定" if has_block else "目前路線"
-    top, scanned, usable = scan(fastly_ranges())
+    top, scanned, usable = scan_cached()
     if not top:
         fail = {"best": None, "apply": False, "reason": "找不到可用的節點（網路不通或被擋）"}
         return {"github": dict(fail, group=GITHUB), "x": dict(fail, group=X_IMAGES), "ranked": [],
@@ -607,38 +665,21 @@ def find_region(text, regions):
     return min(same_city, key=lambda pop: regions[pop][0]["latency_ms"]) if same_city else None
 
 
-def action_region(code=None):
-    """手動選擇地區：列出附近可用的地區，輸入代碼後在該地區挑最穩的線路。"""
-    print("\n正在尋找可用的地區（約 1 分鐘）…")
-    found, _, _ = scan(fastly_ranges(), label="尋找可用的地區…")
-    regions = {}
-    for r in found:
-        regions.setdefault(r["pop"], []).append(r)
-    regions.pop("?", None)
-    for ips in regions.values():
-        ips.sort(key=lambda r: r["latency_ms"])
-    if not regions:
-        print("找不到可用的地區（網路不通或被擋）。")
-        return 1
-    nearest = sorted(regions, key=lambda pop: regions[pop][0]["latency_ms"])
-    print("\n【附近可用的地區】（依延遲排序）")
-    for pop in nearest[:15]:
-        print(f"  {pop}  {pad(POP_NAMES.get(pop, ''), 10)}延遲約 {regions[pop][0]['latency_ms']:.0f} ms")
-    print(f"  …共 {len(regions)} 個地區，不在列表上的代碼也可以輸入")
-
-    if code is None:
-        code = input("\n請輸入地區代碼或城市名稱（例如 ICN 或 首爾），直接按 Enter 取消：").strip()
-        if not code:
-            print("已取消。")
-            return 0
-    pop = find_region(code, regions)
-    if not pop:
-        print(f"找不到「{code}」這個地區，或你的網路目前連不到那裡。")
-        return 1
+def choose_and_apply(pop, ips, verify=False):
+    """在指定地區的線路裡實測挑最穩的，確認後套用（GitHub + 可用的話 X 圖片）。
+    verify=True：IP 來自舊的掃描紀錄，先確認它們現在還連到同一個地區。"""
+    if verify:
+        checked = [probe(GITHUB, c["ip"], tries=3) for c in ips[:REGION_MAX_IPS + 2]]
+        cands = [c for c in checked if c and c["pop"] == pop][:REGION_MAX_IPS]
+        if not cands:
+            print(f"上次記錄的 {place(pop)} 線路現在連不到，或已經改連別的地區。")
+            print("請用「3. 手動選擇地區」重新掃描。")
+            return 1
+    else:
+        cands = ips[:REGION_MAX_IPS]
 
     # 同一個地區不同 IP 的穩定度差很多（實測東京有的 IP 每次都順、有的常卡），所以再挑一次
-    cands = regions[pop][:4]
-    print(f"\n測試 {place(pop)} 的 {len(cands)} 條線路（約 30 秒）…")
+    print(f"\n測試 {place(pop)} 的 {len(cands)} 條線路（約 {max(10, len(cands) * 6)} 秒）…")
     ranked = rank(cands, speed_test(cands, rounds=2, label="測試線路…"))
     for c in ranked:
         vs = " / ".join(f"{v:5.1f}" for v in c["speeds"])
@@ -665,6 +706,245 @@ def action_region(code=None):
         return 0
     args = [f"github={best['ip']}:{pop}"] + ([f"x={x['ip']}:{pop}"] if x else [])
     return action_set(args)
+
+
+def ask_region(code, prompt):
+    if code is None:
+        code = input(prompt).strip()
+    return code
+
+
+def action_region(code=None):
+    """手動選擇地區：重新掃描、列出附近可用的地區，輸入代碼後在該地區挑最穩的線路。"""
+    print("\n正在尋找可用的地區（約 1 分鐘）…")
+    found, _, _ = scan_cached(label="尋找可用的地區…")
+    regions = regions_from(found)
+    if not regions:
+        print("找不到可用的地區（網路不通或被擋）。")
+        return 1
+    nearest = sorted(regions, key=lambda pop: regions[pop][0]["latency_ms"])
+    print("\n【附近可用的地區】（依延遲排序）")
+    for pop in nearest[:15]:
+        print(f"  {pop}  {pad(POP_NAMES.get(pop, ''), 10)}延遲約 {regions[pop][0]['latency_ms']:.0f} ms")
+    print(f"  …共 {len(regions)} 個地區，不在列表上的代碼也可以輸入（「8. 所有節點延遲」可看完整列表）")
+
+    code = ask_region(code, "\n請輸入地區代碼或城市名稱（例如 ICN 或 首爾），直接按 Enter 取消：")
+    if not code:
+        print("已取消。")
+        return 0
+    pop = find_region(code, regions)
+    if not pop:
+        print(f"找不到「{code}」這個地區，或你的網路目前連不到那裡。")
+        return 1
+    return choose_and_apply(pop, regions[pop])
+
+
+def action_switch(code=None):
+    """指定節點：用上次的掃描紀錄，直接輸入代碼切換（不用等掃描）。"""
+    cache = load_scan()
+    if cache:
+        print(f"\n使用上次的掃描紀錄（{cache['time']}）。")
+        regions = regions_from(cache["found"])
+    else:
+        print("\n還沒有掃描紀錄，先掃描一次（約 1 分鐘）…")
+        regions = regions_from(scan_cached(label="尋找可用的地區…")[0])
+    code = ask_region(code, "請輸入節點代碼或城市名稱（例如 ICN 或 首爾），直接按 Enter 取消：")
+    if not code:
+        print("已取消。")
+        return 0
+    pop = find_region(code, regions)
+    from_cache = bool(cache)
+    if not pop and cache and ask_yes(f"上次的紀錄裡沒有「{code}」，要重新掃描再找一次嗎？"):
+        regions = regions_from(scan_cached(label="尋找可用的地區…")[0])
+        pop, from_cache = find_region(code, regions), False
+    if not pop:
+        print(f"找不到「{code}」這個節點，或你的網路目前連不到那裡。")
+        return 1
+    return choose_and_apply(pop, regions[pop], verify=from_cache)
+
+
+def action_list():
+    """查看所有節點的延遲，每頁 10 個。"""
+    cache = load_scan()
+    if cache:
+        rescan = ask_yes(f"\n上次掃描時間：{cache['time']}。要重新掃描所有節點嗎？"
+                         f"（選 n 直接顯示上次的結果）", default=False)
+    else:
+        print("\n還沒有掃描紀錄，需要先掃描所有節點（約 1 分鐘）。")
+        if not ask_yes("要開始掃描嗎？"):
+            return 0
+        rescan = True
+    if rescan:
+        found, scanned, _ = scan(fastly_ranges(), label="掃描所有節點…")
+        # 掃描時同時連線多、延遲不準：每個 IP 再各量 3 次（同時量的數量較少，比較準）
+        total = len(found)
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            futures = {pool.submit(tcp_latency, r["ip"], 3, SCAN_TIMEOUT): r for r in found}
+            for done, fut in enumerate(as_completed(futures), 1):
+                if fut.result():
+                    futures[fut]["latency_ms"] = fut.result()
+                if done % 10 == 0 or done == total:
+                    progress("精確量測延遲…", done, total)
+        found.sort(key=lambda r: r["latency_ms"])
+        regions = regions_from(found)
+        save_scan(found, scanned)
+        when = f"{datetime.now():%Y-%m-%d %H:%M}"
+    else:
+        regions, when = regions_from(cache["found"]), cache["time"]
+    if not regions:
+        print("找不到可用的節點（網路不通或被擋）。")
+        return 1
+
+    rows = sorted(regions.items(), key=lambda kv: kv[1][0]["latency_ms"])
+    per, page = 10, 0
+    pages = (len(rows) + per - 1) // per
+    while True:
+        print(f"\n【所有節點延遲】共 {len(rows)} 個｜第 {page + 1}/{pages} 頁｜掃描時間 {when}")
+        print(f"  {pad('排名', 6)}{pad('代碼', 6)}{pad('城市', 18)}{' ' * 3}延遲   線路數")
+        for i, (pop, ips) in enumerate(rows[page * per:(page + 1) * per], page * per + 1):
+            print(f"  {i:<6}{pop:<6}{pad(POP_NAMES.get(pop, ''), 18)}{ips[0]['latency_ms']:5.0f} ms   {len(ips)}")
+        cmd = input("\nn 下一頁、p 上一頁、q 返回（直接按 Enter = 下一頁）：").strip().lower()
+        if cmd in ("", "n"):
+            if page + 1 < pages:
+                page += 1
+            else:
+                print("已經是最後一頁。")
+        elif cmd == "p":
+            if page > 0:
+                page -= 1
+            else:
+                print("已經是第一頁。")
+        elif cmd == "q":
+            return 0
+        else:
+            print("請輸入 n、p 或 q。")
+
+
+def version_tuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", v)[:3])
+
+
+def http_get(url, timeout=30):
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def action_update():
+    """從 GitHub Releases 檢查並下載新版本。"""
+    print(f"\n正在檢查 GitHub（{REPO}）上的最新版本…")
+    try:
+        rel = json.loads(http_get(f"https://api.github.com/repos/{REPO}/releases/latest"))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            print("GitHub 上還沒有發佈任何版本。")
+            return 1
+        raise
+    latest = rel.get("tag_name", "").lstrip("vV")
+    if not latest or version_tuple(latest) <= version_tuple(VERSION):
+        print(f"已經是最新版（{VERSION}）。")
+        return 0
+    print(f"\n有新版本：{latest}（目前是 {VERSION}）")
+    notes = [l for l in (rel.get("body") or "").splitlines() if l.strip()][:8]
+    for line in notes:
+        print(f"  {line}")
+    if not ask_yes("\n要更新嗎？"):
+        print("已取消。")
+        return 0
+    try:
+        return update_exe(rel, latest) if getattr(sys, "frozen", False) else update_script(rel, latest)
+    except PermissionError:
+        print("沒有權限覆蓋程式檔。請把程式放在自己的資料夾（例如「下載」或「桌面」）再更新。")
+        return 1
+
+
+def update_script(rel, latest):
+    text = http_get(f"https://raw.githubusercontent.com/{REPO}/{rel['tag_name']}/fastly_hosts.py").decode("utf-8")
+    compile(text, "fastly_hosts.py", "exec")     # 確認下載的是完整、能執行的程式
+    if f'VERSION = "{latest}"' not in text:
+        print("下載的檔案版本不符，已取消更新。")
+        return 1
+    path = os.path.abspath(__file__)
+    with open(path + ".new", "w", encoding="utf-8", newline="") as f:
+        f.write(text)
+    os.replace(path + ".new", path)
+    print(f"\n✔ 已更新到 {latest}，請關閉程式後重新開啟。")
+    return 0
+
+
+def update_exe(rel, latest):
+    asset = next((a for a in rel.get("assets", []) if a["name"].endswith("windows-x64.zip")), None)
+    if not asset:
+        print("這個版本沒有提供 Windows 版檔案。")
+        return 1
+    print(f"下載 {asset['name']}（{asset['size'] / 1e6:.1f} MB）…")
+    with zipfile.ZipFile(io.BytesIO(http_get(asset["browser_download_url"], timeout=120))) as z:
+        exe = z.read("fastly-hosts.exe")
+    # 發佈說明裡有 SHA256 就核對，避免下載不完整或被竄改
+    expected = re.search(r"\b[0-9a-fA-F]{64}\b", rel.get("body") or "")
+    actual = hashlib.sha256(exe).hexdigest()
+    if expected and expected.group(0).lower() != actual:
+        print("校驗碼不符（可能下載不完整或檔案被竄改），已取消更新。")
+        return 1
+    if not expected:
+        print("（這個版本的說明沒有提供 SHA256 校驗碼，略過核對）")
+    cur = sys.executable
+    with open(cur + ".new", "wb") as f:
+        f.write(exe)
+    if os.path.exists(cur + ".old"):
+        os.remove(cur + ".old")
+    os.replace(cur, cur + ".old")                # 執行中的 exe 不能覆蓋，但可以改名
+    os.replace(cur + ".new", cur)
+    print(f"\n✔ 已更新到 {latest}，請關閉程式後重新開啟。")
+    return 0
+
+
+def purge_system():
+    """移除 hosts 裡本工具的設定與備份檔（需要管理員 / root）。"""
+    text = read_hosts()
+    if current_block(text):
+        write_hosts(strip_block(text))           # 先改 hosts（若沒有備份會先建立），再刪備份
+        flush_dns()
+    backup = HOSTS_PATH + ".fastly-hosts.bak"
+    if os.path.exists(backup):
+        os.remove(backup)
+    print("✔ 已切回原本的節點，並刪除 hosts 備份檔。")
+    return 0
+
+
+def action_purge():
+    """刪除本工具的所有資料，切回原本的節點。"""
+    has_block = bool(current_block(read_hosts()))
+    backup = HOSTS_PATH + ".fastly-hosts.bak"
+    items = []
+    if has_block:
+        items.append(f"hosts 裡本工具的設定（{HOSTS_PATH}）")
+    if os.path.exists(backup):
+        items.append(f"hosts 備份檔（{backup}）")
+    if os.path.exists(cache_path()):
+        items.append(f"掃描紀錄（{cache_path()}）")
+    if not items:
+        print("\n沒有任何本工具的資料，不需要刪除。")
+        return 0
+    print("\n將會刪除：")
+    for item in items:
+        print(f"  ・{item}")
+    print("（程式本身不會刪除，需要的話請自行刪除）")
+    if not ask_yes("\n確定要刪除嗎？", default=False):
+        print("已取消。")
+        return 0
+    if os.path.exists(cache_path()):
+        os.remove(cache_path())
+        try:
+            os.rmdir(os.path.dirname(cache_path()))
+        except OSError:
+            pass
+        print("✔ 已刪除掃描紀錄。")
+    if has_block or os.path.exists(backup):
+        if is_admin():
+            return purge_system()
+        return 0 if run_elevated("purge-system") else 1
+    return 0
 
 
 def action_set(args):
@@ -725,7 +1005,9 @@ HELP_TEXT = f"""
     2. 實際下載測試好幾次，看哪條路線最穩（約 2 分鐘）
     3. 把最穩的路線寫進電腦的 hosts 檔，讓電腦以後直接走那條路
 
-  也可以用「手動選擇地區」，輸入代碼（例如 ICN）或城市名稱（例如 首爾）指定要走哪裡。
+  也可以自己指定要走哪裡：
+    「3. 手動選擇地區」重新掃描後列出附近的地區再選
+    「6. 指定節點」用上次的掃描紀錄，直接輸入代碼（例如 ICN）或城市名稱切換
 
   好路線會隨網路業者調整而改變，覺得又變慢時重新「套用」一次就好。
   換到其他網路（例如筆電帶出門）覺得變慢，先「還原」。
@@ -757,12 +1039,16 @@ def menu():
 【請選擇】
   1. 測試          找出目前最順的路線，只測試、不改設定（約 3 分鐘）
   2. 自動套用      測試後，把最順的路線設定到電腦上（需要管理員權限）
-  3. 手動選擇地區  輸入代碼（例如 ICN）或城市名稱，指定要走哪裡
+  3. 手動選擇地區  掃描後列出附近的地區，再選擇要走哪裡
   4. 還原          移除本工具的設定，回到原本的狀態
   5. 重新整理      重新檢查目前狀況
-  6. 說明          這個工具在做什麼
+  6. 指定節點      直接輸入代碼（例如 ICN）切換，使用上次的掃描紀錄
+  7. 更新          從 GitHub 檢查並下載新版本
+  8. 所有節點延遲  列出所有節點的延遲，每頁 10 個
+  9. 刪除          刪除本工具的所有資料，切回原本的節點
+  h. 說明          這個工具在做什麼
   0. 離開""")
-        choice = input("\n請輸入數字：").strip()
+        choice = input("\n請輸入數字（h = 說明）：").strip()
         try:
             if choice == "1":
                 action_test()
@@ -779,11 +1065,21 @@ def menu():
                 st = None
                 continue
             elif choice == "6":
+                action_switch()
+                st = None
+            elif choice == "7":
+                action_update()
+            elif choice == "8":
+                action_list()
+            elif choice == "9":
+                action_purge()
+                st = None
+            elif choice.lower() == "h":
                 print(HELP_TEXT)
             elif choice == "0":
                 return 0
             else:
-                print("請輸入 0～6 的數字。")
+                print("請輸入 0～9 的數字，或 h。")
                 continue
         except PermissionError as e:
             print(f"\n寫入失敗，沒有權限：{e}")
@@ -798,6 +1094,9 @@ def main(argv):
     yes = "--yes" in argv
     cmds = {"test": lambda: (action_test(interactive=False), 0)[1], "apply": lambda: action_apply(yes),
             "region": lambda: action_region(args[1] if len(args) > 1 else None),
+            "switch": lambda: action_switch(args[1] if len(args) > 1 else None),
+            "list": action_list, "update": action_update, "purge": action_purge,
+            "purge-system": lambda: purge_system() if is_admin() else (print("需要管理員 / root 權限。"), 1)[1],
             "set": lambda: action_set(args[1:]), "restore": action_restore, "status": action_status}
     if args and args[0] not in cmds:
         print(__doc__)
@@ -814,7 +1113,16 @@ def main(argv):
             input("\n按 Enter 關閉這個視窗…")
 
 
+def cleanup_old_exe():
+    if getattr(sys, "frozen", False) and os.path.exists(sys.executable + ".old"):
+        try:
+            os.remove(sys.executable + ".old")
+        except OSError:
+            pass
+
+
 if __name__ == "__main__":
+    cleanup_old_exe()
     # 輸出被導向到檔案、或遇到不支援中文的編碼時，用 ? 代替，不要讓程式當掉
     for stream in (sys.stdout, sys.stderr):
         try:
