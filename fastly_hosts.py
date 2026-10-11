@@ -41,7 +41,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
-VERSION = "0.8.1"
+VERSION = "0.8.2"
 IS_WINDOWS = platform.system() == "Windows"
 HOSTS_PATH = (os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "drivers", "etc", "hosts")
               if IS_WINDOWS else "/etc/hosts")
