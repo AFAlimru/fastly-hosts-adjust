@@ -406,3 +406,70 @@ def test_tcp_latency_refused_port_returns_none(monkeypatch):
 def test_cancelled_returns_zero():
     assert fh.cancelled() == 0
     assert fh.cancelled(changed=True) == 0
+
+
+# ---------------------------------------------------------------- 寫入 hosts 失敗與唯讀（議題 #3）
+
+import os
+import stat
+import sys
+
+windows_only = pytest.mark.skipif(sys.platform != "win32", reason="唯讀屬性只有 Windows 會擋住系統管理員")
+
+
+@pytest.fixture()
+def fake_hosts(tmp_path, monkeypatch):
+    """暫存的 hosts 檔與資料夾，並假裝有管理員權限、不清 DNS 快取。"""
+    hosts = tmp_path / "hosts"
+    hosts.write_text("127.0.0.1 localhost\n", encoding="latin-1")
+    monkeypatch.setattr(fh, "HOSTS_PATH", str(hosts))
+    monkeypatch.setattr(fh, "data_dir", lambda: str(tmp_path / "data"))
+    monkeypatch.setattr(fh, "is_admin", lambda: True)
+    monkeypatch.setattr(fh, "flush_dns", lambda: None)
+    yield hosts
+    for p in (hosts, tmp_path / "hosts.fastly-hosts.bak"):
+        if p.exists():
+            os.chmod(p, stat.S_IREAD | stat.S_IWRITE)
+
+
+@windows_only
+def test_write_hosts_readonly_is_written_and_stays_readonly(fake_hosts):
+    os.chmod(fake_hosts, stat.S_IREAD)
+    fh.write_hosts("127.0.0.1 localhost\n# changed\n")
+    assert "# changed" in fake_hosts.read_text(encoding="latin-1")
+    assert fh.is_readonly(str(fake_hosts))
+
+
+@windows_only
+def test_purge_removes_readonly_backup(fake_hosts, isolated_config):
+    os.chmod(fake_hosts, stat.S_IREAD)
+    fh.action_set(["github=146.75.48.133:ICN"])          # 備份從唯讀的 hosts 複製，也會是唯讀
+    backup = str(fake_hosts) + ".fastly-hosts.bak"
+    assert fh.is_readonly(backup)
+    assert fh.purge_system() == 0
+    assert not os.path.exists(backup)
+
+
+def test_set_permission_error_prints_lines_to_add(fake_hosts, isolated_config, monkeypatch, capsys):
+    def denied(text):
+        raise PermissionError(13, "Permission denied", fh.HOSTS_PATH)
+    monkeypatch.setattr(fh, "write_hosts", denied)
+    fh.LANG = "zh"
+    assert fh.action_set(["github=146.75.48.133:ICN"]) == 1
+    out = capsys.readouterr().out
+    assert fh.MARK_BEGIN in out and fh.MARK_END in out
+    assert "146.75.48.133\traw.githubusercontent.com" in out
+    saved = open(fh.manual_path(), encoding="utf-8").read()
+    assert "146.75.48.133\trelease-assets.githubusercontent.com" in saved
+
+
+def test_restore_permission_error_explains_without_lines(fake_hosts, monkeypatch, capsys):
+    fh.action_set(["github=146.75.48.133:ICN"])
+    def denied(text):
+        raise PermissionError(13, "Permission denied", fh.HOSTS_PATH)
+    monkeypatch.setattr(fh, "write_hosts", denied)
+    fh.LANG = "en"
+    assert fh.action_restore() == 1
+    out = capsys.readouterr().out
+    assert "Could not write hosts" in out
+    assert "copy from the next line" not in out

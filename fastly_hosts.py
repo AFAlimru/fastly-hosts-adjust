@@ -31,6 +31,7 @@ import re
 import shutil
 import socket
 import ssl
+import stat
 import statistics
 import subprocess
 import sys
@@ -41,7 +42,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
-VERSION = "0.8.2"
+VERSION = "0.8.3"
 IS_WINDOWS = platform.system() == "Windows"
 HOSTS_PATH = (os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "drivers", "etc", "hosts")
               if IS_WINDOWS else "/etc/hosts")
@@ -877,13 +878,33 @@ def current_block(text):
     return lines
 
 
+def is_readonly(path):
+    """Windows 的「唯讀」屬性：設了之後連系統管理員也不能直接寫入（Linux 的 root 不受檔案權限限制）。"""
+    if not IS_WINDOWS:
+        return False
+    try:
+        return bool(os.stat(path).st_file_attributes & stat.FILE_ATTRIBUTE_READONLY)
+    except (OSError, AttributeError):
+        return False
+
+
 def write_hosts(text):
     backup = HOSTS_PATH + ".fastly-hosts.bak"
     if not os.path.exists(backup):       # 只在第一次備份，保留最原始的版本
         shutil.copy2(HOSTS_PATH, backup)
     newline = "\r\n" if IS_WINDOWS else "\n"
-    with open(HOSTS_PATH, "w", encoding="latin-1", newline=newline) as f:
-        f.write(text)
+    # 有些優化或防廣告工具會把 hosts 設成唯讀：暫時取消，寫完再設回去，保留使用者原本的保護
+    readonly = is_readonly(HOSTS_PATH)
+    if readonly:
+        print(L("（hosts 是唯讀的，暫時取消唯讀來寫入，寫完會再設回唯讀）",
+                "(hosts is read-only; temporarily clearing the flag to write, it will be restored)"))
+        os.chmod(HOSTS_PATH, stat.S_IREAD | stat.S_IWRITE)
+    try:
+        with open(HOSTS_PATH, "w", encoding="latin-1", newline=newline) as f:
+            f.write(text)
+    finally:
+        if readonly:
+            os.chmod(HOSTS_PATH, stat.S_IREAD)
     return backup
 
 
@@ -896,17 +917,77 @@ def flush_dns():
             pass
 
 
-def write_routes(routes):
-    """routes：[(服務, 路線 IP, 節點代碼), ...]。整段取代本工具的設定，回傳備份檔路徑。
+def block_lines(routes):
+    """routes：[(服務, 路線 IP, 節點代碼), ...] → 要寫進 hosts 的整段文字（每行一筆）。
     路線 IP 可以是該 /24 的任何尾碼，每個網域會換成自己的尾碼。"""
     lines = [MARK_BEGIN, f"# applied {datetime.now():%Y-%m-%d %H:%M}"]
     for svc, ip, pop in routes:
         lines.append(f"# {svc['key']}: Fastly {pop}")
         lines += [f"{same_24(ip, sfx)}\t{host}" for host, sfx in svc["hosts"]]
     lines.append(MARK_END)
-    backup = write_hosts(strip_block(read_hosts()) + "\n" + "\n".join(lines) + "\n")
+    return lines
+
+
+def write_routes(routes):
+    """整段取代本工具的設定，回傳備份檔路徑。"""
+    backup = write_hosts(strip_block(read_hosts()) + "\n" + "\n".join(block_lines(routes)) + "\n")
     flush_dns()
     return backup
+
+
+def manual_path():
+    return os.path.join(data_dir(), "hosts-manual.txt")
+
+
+def explain_manual(error, lines=None):
+    """寫入失敗（防毒軟體保護、其他程式正開著 hosts…）：教使用者手動修改。
+    lines=None 表示要移除本工具的區塊（還原 / 刪除時）。"""
+    print(L(f"\n寫入 hosts 失敗：{error}", f"\nCould not write hosts: {error}"))
+    print(L("常見原因：防毒軟體保護 hosts，或有其他程式正開著它。可以改成手動修改：\n",
+            "Usually antivirus software is protecting hosts, or another program has it open. "
+            "You can edit it by hand instead:\n"))
+    if IS_WINDOWS:
+        print(L("  1. 按「開始」搜尋「記事本」，在記事本上按右鍵 →「以系統管理員身分執行」\n"
+                "  2. 在記事本選「檔案 → 開啟」，右下角的檔案類型改成「所有檔案」，開啟：\n"
+                f"     {HOSTS_PATH}",
+                "  1. Search for \"Notepad\" in the Start menu, right-click it → \"Run as administrator\"\n"
+                "  2. In Notepad choose \"File → Open\", set the file type to \"All files\", and open:\n"
+                f"     {HOSTS_PATH}"))
+    else:
+        print(L(f"  1. 在終端機執行：sudo nano {HOSTS_PATH}", f"  1. In a terminal run: sudo nano {HOSTS_PATH}"))
+        print(L("  2. （nano 用方向鍵移動，Ctrl+O 存檔、Ctrl+X 離開）", "  2. (in nano: arrow keys to move, Ctrl+O to save, Ctrl+X to exit)"))
+    print(L(f"  3. 如果檔案裡有「{MARK_BEGIN[:22]}…」到「{MARK_END}」的舊區塊，整段刪掉",
+            f"  3. If the file has an old block from \"{MARK_BEGIN[:22]}...\" to \"{MARK_END}\", delete all of it"))
+    if lines:
+        print(L("  4. 把下面這段貼到檔案最後面，然後存檔：", "  4. Paste the following at the end of the file and save:"))
+        print(L("\n----- 從下一行開始複製 -----", "\n----- copy from the next line -----"))
+        print("\n".join(lines))
+        print(L("----- 複製到上一行為止 -----\n", "----- copy up to the previous line -----\n"))
+        if _can_write_user_data():
+            try:
+                os.makedirs(data_dir(), exist_ok=True)
+                with open(manual_path(), "w", encoding="utf-8", newline="\r\n" if IS_WINDOWS else "\n") as f:
+                    f.write("\n".join(lines) + "\n")
+                print(L(f"     （同樣的內容也存成了檔案，方便複製：{manual_path()}）",
+                        f"     (The same text is saved here for easy copying: {manual_path()})"))
+            except OSError:
+                pass
+        step = "5"
+    else:
+        print(L("  4. 存檔", "  4. Save the file"))
+        step = "5"
+    if IS_WINDOWS:
+        print(L(f"  {step}. 以系統管理員身分開啟「命令提示字元」，執行：ipconfig /flushdns",
+                f"  {step}. Open \"Command Prompt\" as administrator and run: ipconfig /flushdns"))
+        print(L("\n如果存檔時也被拒絕：請在防毒軟體中暫時允許修改 hosts，或暫停它的保護功能。",
+                "\nIf saving is refused too: allow hosts changes in your antivirus, or pause its protection."))
+    else:
+        print(L(f"  {step}. 執行：sudo resolvectl flush-caches", f"  {step}. Run: sudo resolvectl flush-caches"))
+        print(L(f"\n如果存檔時也被拒絕：hosts 可能被設成不可修改，用 lsattr {HOSTS_PATH} 檢查，"
+                f"有 i 屬性的話用 sudo chattr -i {HOSTS_PATH} 解除。",
+                f"\nIf saving is refused too, hosts may be immutable: check with lsattr {HOSTS_PATH} and "
+                f"remove the i flag with sudo chattr -i {HOSTS_PATH}."))
+    return 1
 
 
 # ---------------------------------------------------------------- 權限
@@ -1000,8 +1081,11 @@ def action_apply(yes=False):
     # 先拿掉舊設定再測，避免量到自己上次寫入的結果
     original = read_hosts()
     if current_block(original):
-        write_hosts(strip_block(original))
-        flush_dns()
+        try:
+            write_hosts(strip_block(original))
+            flush_dns()
+        except PermissionError:
+            pass            # 寫不進去：照樣測試（拿目前設定比較），最後寫入時再說明怎麼手動修改
     result = action_test(interactive=not yes)
     routes = [(r["svc"], r["best"]["ip"], r["best"]["pop"]) for r in result["results"] if r["apply"]]
     if not routes:
@@ -1010,7 +1094,10 @@ def action_apply(yes=False):
         return 0
     if not yes and not ask_yes(L("\n要套用上面建議的路線嗎？", "\nApply the suggested route(s)?")):
         return cancelled()
-    backup = write_routes(routes)
+    try:
+        backup = write_routes(routes)
+    except PermissionError as e:
+        return explain_manual(e, block_lines(routes))
     print(L("\n✔ 已套用！之後會走新的路線。", "\n✔ Applied! The new route(s) are now in use."))
     print(L(f"  （設定寫在 {HOSTS_PATH}，原始檔案備份在 {backup}）",
             f"  (Written to {HOSTS_PATH}; original backed up to {backup})"))
@@ -1464,10 +1551,15 @@ def purge_system():
     """移除 hosts 裡本工具的設定與備份檔（需要管理員 / root）。"""
     text = read_hosts()
     if current_block(text):
-        write_hosts(strip_block(text))           # 先改 hosts（若沒有備份會先建立），再刪備份
+        try:
+            write_hosts(strip_block(text))       # 先改 hosts（若沒有備份會先建立），再刪備份
+        except PermissionError as e:
+            return explain_manual(e)
         flush_dns()
     backup = HOSTS_PATH + ".fastly-hosts.bak"
     if os.path.exists(backup):
+        if is_readonly(backup):                  # 備份是從唯讀的 hosts 複製來的，也會是唯讀
+            os.chmod(backup, stat.S_IREAD | stat.S_IWRITE)
         os.remove(backup)
     print(L("✔ 已切回原本的節點，並刪除 hosts 備份檔。", "✔ Back to the original route; hosts backup deleted."))
     return 0
@@ -1477,7 +1569,7 @@ def action_purge():
     """刪除本工具的所有資料，切回原本的節點。"""
     has_block = bool(current_block(read_hosts()))
     backup = HOSTS_PATH + ".fastly-hosts.bak"
-    user_files = [p for p in (cache_path(), config_path()) if os.path.exists(p)]
+    user_files = [p for p in (cache_path(), config_path(), manual_path()) if os.path.exists(p)]
     items = []
     if has_block:
         items.append(L(f"hosts 裡本工具的設定（{HOSTS_PATH}）", f"This tool's entries in hosts ({HOSTS_PATH})"))
@@ -1487,6 +1579,8 @@ def action_purge():
         items.append(L(f"掃描紀錄（{cache_path()}）", f"Scan record ({cache_path()})"))
     if os.path.exists(config_path()):
         items.append(L(f"語言與服務設定（{config_path()}）", f"Language and service settings ({config_path()})"))
+    if os.path.exists(manual_path()):
+        items.append(L(f"手動修改說明檔（{manual_path()}）", f"Manual-edit text file ({manual_path()})"))
     if not items:
         print(L("\n沒有任何本工具的資料，不需要刪除。", "\nThere is no data from this tool to delete."))
         return 0
@@ -1532,7 +1626,10 @@ def action_set(args):
         return 2
     if not is_admin():
         return 0 if run_elevated("set", args) else 1
-    backup = write_routes(routes)
+    try:
+        backup = write_routes(routes)
+    except PermissionError as e:
+        return explain_manual(e, block_lines(routes))
     print(L("\n✔ 已套用！", "\n✔ Applied!"))
     for svc, ip, pop in routes:
         label = pad(sname(svc) + L("：", ":"), 22)
@@ -1549,7 +1646,10 @@ def action_restore():
     if not current_block(text):
         print(L("\n目前沒有本工具的設定，不需要還原。", "\nNothing from this tool to restore."))
         return 0
-    write_hosts(strip_block(text))
+    try:
+        write_hosts(strip_block(text))
+    except PermissionError as e:
+        return explain_manual(e)
     flush_dns()
     print(L("\n✔ 已還原，回到系統原本的路線。", "\n✔ Restored to the system's original route."))
     return 0
