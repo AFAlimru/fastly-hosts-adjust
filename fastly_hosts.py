@@ -41,7 +41,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
-VERSION = "0.8.0"
+VERSION = "0.8.1"
 IS_WINDOWS = platform.system() == "Windows"
 HOSTS_PATH = (os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "drivers", "etc", "hosts")
               if IS_WINDOWS else "/etc/hosts")
@@ -650,7 +650,7 @@ def evaluate(svc, found, base_word, extra_base=(), step=""):
                 "reason": L("找不到可用的路線", "No usable route found")}
     measured = True
     try:
-        speeds = speed_test(svc, cands, step + L(f"測試 {sname(svc)} 的下載速度…", f"testing {sname(svc)} speed…"))
+        speeds = speed_test(svc, cands, step + L(f"測速：{sname(svc)}…", f"speed test: {sname(svc)}…"))
     except Exception as e:      # 抓不到測速檔：只依延遲挑選
         print(L(f"  （{sname(svc)}：{e}，改成只依延遲挑選）", f"  ({sname(svc)}: {e}; choosing by latency only)"))
         speeds, measured = {}, False
@@ -740,15 +740,19 @@ def analyze():
 
     services = enabled_services()
     keys = scan_keys(services)
-    sc = scan_cached(L("步驟 1/2：尋找附近的節點…", "Step 1/2: finding nearby nodes…"), keys)
+    # 步驟：1 找節點，之後每個有自己路線的服務各一步（例如 GitHub、Twitch → 共 3 步）
+    steps = 1 + len(keys)
+    sc = scan_cached(L(f"步驟 1/{steps}：尋找附近的節點…", f"Step 1/{steps}: finding nearby nodes…"), keys)
     out = {"results": [], **sc}
     evaluated = {}
+    step = 1
     for svc in tested():
         if svc["key"] in keys:
+            step += 1
             extra = ([same_24(ip, 133) for ip in resolve_system(X_IMAGES["probe"][0])]
                      if svc is GITHUB and X_IMAGES in services else [])
             evaluated[svc["key"]] = evaluate(svc, sc["found"][svc["key"]], base_word(svc), extra,
-                                             L("步驟 2/2：", "Step 2/2: "))
+                                             L(f"步驟 {step}/{steps}：", f"Step {step}/{steps}: "))
     for svc in services:
         if svc is X_IMAGES:
             out["results"].append(evaluate_x(evaluated["github"]["ranked"], base_word(X_IMAGES)))
