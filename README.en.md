@@ -167,6 +167,15 @@ Some antivirus software treats changing the hosts file as suspicious. All the co
 **Does it only work on Chunghwa Telecom?**
 It works on any network; tests are based on the nodes nearest to you. So far, the improvement has only been verified on Chunghwa Telecom.
 
+## Running the tests
+
+Automated tests live in `tests/` (no network access, no hosts changes) and run on Linux and Windows:
+
+```sh
+pip install pytest
+python3 -m pytest tests/
+```
+
 ## Build the Windows exe yourself
 
 - On Windows: install Python, then run `build\build-windows.bat`

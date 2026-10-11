@@ -6,3 +6,4 @@ dist/
 # 開發用：研究資料與打包環境
 research/
 .winbuild/
+.pytest_cache/

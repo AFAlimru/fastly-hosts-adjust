@@ -1,7 +1,8 @@
-"""Tests for AFAlimru/fastly-hosts-adjust (upstream/fastly_hosts.py, MIT).
+"""fastly_hosts.py 的測試。
 
-Scope: 纯函数 + 配置逻辑 + 失败路径。不碰网络（不扫真实 IP）、不写 /etc/hosts、
-不读用户真实配置（见 conftest.isolated_config）。
+範圍：純函式、設定邏輯、失敗路徑。不連網路（不掃描真實 IP）、不寫 /etc/hosts、
+不讀使用者真正的設定（見 conftest.isolated_config）。在 Linux 和 Windows 上都能執行：
+  python3 -m pytest tests/
 """
 import json
 
@@ -10,7 +11,7 @@ import pytest
 import fastly_hosts as fh
 
 
-# ---------------------------------------------------------------- 语言 L()
+# ---------------------------------------------------------------- 語言 L()
 
 def test_L_zh_returns_chinese_and_fixes_checkmark():
     fh.LANG = "zh"
@@ -37,6 +38,9 @@ def test_sname_uses_current_language():
 # ---------------------------------------------------------------- detect_lang()
 
 def _clear_locale(monkeypatch):
+    # Windows 上 detect_lang() 用系統 API 判斷、不看環境變數；這裡固定測環境變數那條路，
+    # 讓這些測試在 Windows 上也能跑
+    monkeypatch.setattr(fh, "IS_WINDOWS", False)
     for var in ("LC_ALL", "LC_MESSAGES", "LANG"):
         monkeypatch.delenv(var, raising=False)
 
@@ -246,7 +250,7 @@ def test_rank_tie_breaks_on_median_speed():
     cands = [_cand("1.1.1.133", 9), _cand("2.2.2.133", 9)]
     speeds = {"1.1.1.133": [10.0, 1.0], "2.2.2.133": [8.0, 2.0]}
     ranked = fh.rank(cands, speeds)
-    # 阈值 3.0：两者 fast 都是 1；median 5.5 > 5.0 → 1.1.1.133 排前
+    # 門檻 3.0：兩者 fast 都是 1；median 5.5 > 5.0 → 1.1.1.133 排前面
     assert ranked[0]["ip"] == "1.1.1.133"
     assert ranked[1]["ip"] == "2.2.2.133"
 
@@ -258,7 +262,7 @@ def test_rank_without_speed_data_falls_back_to_latency():
 
 
 def test_rank_floor_threshold_blocks_all_slow_routes():
-    # 全部卡住时 FAST_FLOOR_MBPS=3.0 兜底：fast 全为 0，按 median 再按延迟排
+    # 全部卡住時由 FAST_FLOOR_MBPS=3.0 把關：fast 全為 0，依 median 再依延遲排序
     cands = [_cand("1.1.1.133", 10), _cand("2.2.2.133", 20)]
     speeds = {"1.1.1.133": [1.0, 1.2], "2.2.2.133": [2.0, 2.1]}
     ranked = fh.rank(cands, speeds)
@@ -273,7 +277,7 @@ def test_regions_from_groups_and_sorts_by_latency():
         {"ip": "a", "pop": "NRT", "latency_ms": 20},
         {"ip": "b", "pop": "NRT", "latency_ms": 10},
         {"ip": "c", "pop": "?", "latency_ms": 1},
-        {"ip": "d", "latency_ms": 2},          # 无 pop 字段直接跳过
+        {"ip": "d", "latency_ms": 2},          # 沒有 pop 欄位：直接略過
     ]}
     regions = fh.regions_from(found)
     assert list(regions.keys()) == ["NRT"]
@@ -296,7 +300,7 @@ def test_find_region_by_code_case_insensitive():
 
 
 def test_find_region_by_english_city_picks_fastest():
-    # Tokyo 对应 NRT/HND/TYO：选延迟最低的 NRT
+    # Tokyo 對應 NRT/HND/TYO：選延遲最低的 NRT
     assert fh.find_region("Tokyo", REGIONS) == "NRT"
 
 
@@ -380,7 +384,7 @@ def test_all_services_includes_custom_from_config(isolated_config):
     assert fh.svc_by_key("custom:cdn.example")["key"] == "custom:cdn.example"
 
 
-# ---------------------------------------------------------------- 失败路径（无网络）
+# ---------------------------------------------------------------- 失敗路徑（不連網路）
 
 def test_add_custom_domain_rejects_invalid_hostname(isolated_config):
     assert fh.add_custom_domain("not a domain!!", ask=False) is False
@@ -390,9 +394,13 @@ def test_add_custom_domain_rejects_already_listed_domain(isolated_config):
     assert fh.add_custom_domain("raw.githubusercontent.com", ask=False) is False
 
 
-def test_tcp_latency_refused_port_returns_none():
-    # 127.0.0.1:443 本机无监听 → 连接被拒 → 返回 None（失败路径）
-    assert fh.tcp_latency("127.0.0.1", tries=1, timeout=1) is None
+def test_tcp_latency_refused_port_returns_none(monkeypatch):
+    # 模擬每次連線都被拒絕 → 回傳 None。用模擬而不是真的連 127.0.0.1:443，
+    # 否則本機剛好有服務在 443 埠時這個測試會失敗
+    def refuse(*args, **kwargs):
+        raise ConnectionRefusedError
+    monkeypatch.setattr(fh.socket, "create_connection", refuse)
+    assert fh.tcp_latency("192.0.2.1", tries=2, timeout=1) is None
 
 
 def test_cancelled_returns_zero():

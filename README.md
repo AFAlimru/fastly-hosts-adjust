@@ -167,6 +167,15 @@ hosts 檔是系統檔案，只有管理員 / root 能修改。「測試」不需
 **只支援中華電信嗎？**
 任何網路都可以用，程式會以你所在位置最近的節點為基準來測試。不過目前只在中華電信上實際驗證過效果。
 
+## 執行測試
+
+`tests/` 裡有自動化測試（不連網路、不改 hosts），Linux 和 Windows 都能執行：
+
+```sh
+pip install pytest
+python3 -m pytest tests/
+```
+
 ## 自己打包 Windows exe
 
 - 在 Windows 上：安裝 Python 後，執行 `build\build-windows.bat`
